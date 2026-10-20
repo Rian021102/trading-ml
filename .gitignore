@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Downloaded prices (re-created by any script that downloads)
+data/
+
+# Generated charts and results (re-created by running the scripts)
+images/
+src/output/*
+# ...except the paper-trading log, which can't be regenerated
+!src/output/signals_log.csv
