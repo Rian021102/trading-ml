@@ -142,17 +142,17 @@ def checkpoints(h: pd.DataFrame, mkt_h: pd.DataFrame | None) -> pd.DataFrame:
 NOT_X = ("day", "k", "price", "sig", "y")
 
 
-def fit_predict(X_tr: pd.DataFrame, z_tr: np.ndarray, X_te: pd.DataFrame, seed: int) -> np.ndarray:
+def fit_models(X_tr: pd.DataFrame, z_tr: np.ndarray, seed: int) -> list:
     from lightgbm import LGBMRegressor
 
-    out = np.empty((len(X_te), len(lf.QUANTILES)))
-    for k, q in enumerate(lf.QUANTILES):
-        m = LGBMRegressor(objective="quantile", alpha=q, n_estimators=200, learning_rate=0.03,
+    return [LGBMRegressor(objective="quantile", alpha=q, n_estimators=200, learning_rate=0.03,
                           num_leaves=15, max_depth=4, min_child_samples=50, subsample=0.8,
-                          subsample_freq=1, colsample_bytree=0.7, random_state=seed, verbose=-1)
-        m.fit(X_tr, z_tr)
-        out[:, k] = m.predict(X_te)
-    return np.sort(out, axis=1)
+                          subsample_freq=1, colsample_bytree=0.7, random_state=seed, verbose=-1).fit(X_tr, z_tr)
+            for q in lf.QUANTILES]
+
+
+def predict_z(models: list, X: pd.DataFrame) -> np.ndarray:
+    return np.sort(np.column_stack([m.predict(X) for m in models]), axis=1)
 
 
 def conformal(days: np.ndarray, z: np.ndarray, zp: np.ndarray, oos_days: list, window: int) -> dict:
@@ -190,51 +190,55 @@ def evaluate(rows: pd.DataFrame, preds: dict[str, np.ndarray], test: np.ndarray)
 # ----------------------------------------------------------------------------
 # Main computation
 # ----------------------------------------------------------------------------
-def run(ticker: str, market: str | None, data_dir: str, live_at: pd.Timestamp, price: float,
-        open_: float, prev_close: float, offline: bool = False, test_days: int = 120,
-        calib_days: int = 60, retrain: int = 5, seed: int = 42) -> dict:
-    """Test-period check on finished days, then the forecast for today's close from
-    `price` at `live_at` (WIB). Returns what next_day.py needs to print and log."""
-    h_all = load_hourly(ticker, data_dir, offline)
-    mkt_h = load_hourly(market, data_dir, offline) if market else None
-    today = live_at.date()
-    fri = live_at.dayofweek == 4
-    h = h_all[h_all.index.date < today]
-    done = [ts for ts in h_all.index[h_all.index.date == today]
-            if ts.hour in SLOTS[fri] and ts.hour != 16 and slot_window(ts.hour, fri)[1] <= live_at.time()]
+def load(ticker: str, market: str | None, data_dir: str, offline: bool) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Hourly bars for the stock and the market index (includes today's bars so far)."""
+    return load_hourly(ticker, data_dir, offline), (load_hourly(market, data_dir, offline) if market else None)
 
-    # ---- history: walk-forward + rolling calibration
+
+def fit(h_all: pd.DataFrame, mkt_h: pd.DataFrame | None, today, label: str, test_days: int = 120,
+        calib_days: int = 60, retrain: int = 5, seed: int = 42) -> dict:
+    """Walk-forward test and final models on the days before `today`. Cache it per day;
+    predict() applies it to the live price."""
+    h = h_all[h_all.index.date < today]
     rows = checkpoints(h, mkt_h)
     cols = [c for c in rows.columns if c not in NOT_X]
     X, z = rows[cols], (rows["y"] / rows["sig"]).values
     days = rows["day"].values
     all_days = sorted(rows["day"].unique())
     if len(all_days) < test_days + calib_days + 120:
-        raise ValueError(f"{ticker}: only {len(all_days)} days of hourly data.")
+        raise ValueError(f"{label}: only {len(all_days)} days of hourly data.")
     oos_days = all_days[-test_days - calib_days:]
     zp = np.full((len(rows), len(lf.QUANTILES)), np.nan)
     for i in range(0, len(oos_days), retrain):
         tr, te = days < oos_days[i], np.isin(days, oos_days[i:i + retrain])
-        zp[te] = fit_predict(X[tr], z[tr], X[te], seed)
+        zp[te] = predict_z(fit_models(X[tr], z[tr], seed), X[te])
     shift = conformal(days, z, zp, oos_days, calib_days)
     adj = np.array([shift.get(d, np.zeros(3)) for d in days])
     sig = rows["sig"].values[:, None]
     preds = {"LightGBM": np.sort((zp + adj) * sig, axis=1),
              "Baseline": np.array([-lf.Z90, 0, lf.Z90])[None, :] * sig}
     test = np.isin(days, all_days[-test_days:])
+    return {"label": label, "cols": cols, "models": fit_models(X, z, seed), "shift": shift[None],
+            "v_today": slot_variance(h).iloc[-1], "ev": evaluate(rows, preds, test),
+            "n_test": int(len(all_days[-test_days:]))}
 
-    # ---- now
-    v_today = slot_variance(h).iloc[-1]
-    sig_now = np.sqrt(remaining_var(v_today, fri, live_at.time()))
+
+def predict(state: dict, h_all: pd.DataFrame, mkt_h: pd.DataFrame | None, live_at: pd.Timestamp,
+            price: float, open_: float, prev_close: float) -> dict:
+    """Today's close as P10 / P50 / P90 from `price` at `live_at` (WIB)."""
+    today, fri = live_at.date(), live_at.dayofweek == 4
+    h = h_all[h_all.index.date < today]
+    done = [ts for ts in h_all.index[h_all.index.date == today]
+            if ts.hour in SLOTS[fri] and ts.hour != 16 and slot_window(ts.hour, fri)[1] <= live_at.time()]
+    sig_now = np.sqrt(remaining_var(state["v_today"], fri, live_at.time()))
     f_now = hourly_features(pd.concat([h, h_all.loc[done]]), mkt_h)
     k = done[-1].hour if done else None
     x_now = checkpoint_x(f_now.iloc[-1], k, fri, price, open_, prev_close, sig_now)
-    z_now = fit_predict(X, z, x_now[cols].to_frame().T.astype(float), seed) + shift[None]
-    q = {"LightGBM": np.sort(z_now[0]) * sig_now, "Baseline": np.array([-lf.Z90, 0, lf.Z90]) * sig_now}
+    z_now = predict_z(state["models"], x_now[state["cols"]].to_frame().T.astype(float))[0] + state["shift"]
+    q = {"LightGBM": np.sort(z_now) * sig_now, "Baseline": np.array([-lf.Z90, 0, lf.Z90]) * sig_now}
     return {
-        "label": ticker, "live_at": live_at, "price": price, "open": open_, "prev_close": prev_close,
+        "label": state["label"], "live_at": live_at, "price": price, "open": open_, "prev_close": prev_close,
         "checkpoint": LABEL[k], "sig_rem": sig_now / 100,
         "now": {m: price * np.exp(v / 100) for m, v in q.items()},        # close P10 / P50 / P90 prices
-        "ev": evaluate(rows, preds, test), "n_test": int(len(all_days[-test_days:])),
-        "hourly_last": h_all.index[-1],
+        "ev": state["ev"], "n_test": state["n_test"],
     }

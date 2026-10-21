@@ -29,7 +29,7 @@ look-ahead bias, gives a daily **BUY / HOLD / SELL** suggestion, and forecasts a
 
 | Script (in `src/`) | What it does | Typical run time |
 |---|---|---|
-| `stock_cli.py` | **Start here.** Interactive tool: type a code, get the backtest, signal, forecast and a next-day suggestion. | ~4 min per stock |
+| `stock_cli.py` | **Start here.** Interactive tool, run any time: type a code, get the backtest, signal, open/close forecasts and a BUY / HOLD / SELL / WAIT decision for the next session (or today's pre-closing during the session). | first run after a close ~5–8 min, then seconds |
 | `bbca_walkforward.py` | The engine: data download, features, walk-forward models, backtest, HTML report. Other scripts import it. | ~1 min |
 | `today_signal.py` | Today's BUY / SELL / HOLD / STAY OUT for one stock, logged for paper-trading. | ~1 min |
 | `lstm_forecast.py` | LSTM forecast of the 80% price range for the next 20 trading days, with an honesty check. | ~2 min (GPU) |
@@ -103,7 +103,7 @@ python stock_cli.py MTLA BBCA     # analyses these first, then asks
 
 1. Type a stock code, e.g. `mtla`. `.JK` is added for you, so `mtla` becomes `MTLA.JK`.
 2. Answer **Do you own MTLA.JK now? [y/N]**. The suggestion depends on it (see [below](#the-next-day-suggestion)).
-3. Wait about 4 minutes. It prints the backtest table, the last 10 sessions, the LSTM forecast tables and a **summary** with the suggestion and prices, then opens the forecast chart.
+3. The first run after a close takes a few minutes (models are trained and cached); later runs that day take seconds. It prints the backtest table, the last 10 sessions, the LSTM tables, the next-session forecast and scorecard (plus the intraday update during the session) and a **summary** with both calls, the decision and prices, then opens the forecast chart.
 4. Type another code, or press **Esc** for the menu: `1` = another company, `2` = exit.
    **Ctrl-C** cancels an analysis that's running.
 
@@ -115,6 +115,7 @@ Useful options:
 | `--seeds 2` | Smaller LSTM ensemble, faster but noisier |
 | `--no-open` | Don't open the chart automatically |
 | `--offline` | Use the CSVs already in `data/` instead of downloading |
+| `--refresh` | Retrain instead of reusing the models cached at the last close |
 | `--threshold 0.55 --exit-threshold 0.50 --smooth 3` | Signal settings (these are the defaults) |
 | `--model LogReg` | Use Logistic Regression or `LightGBM+GARCH` instead of LightGBM |
 
@@ -262,24 +263,40 @@ try lower levels, e.g. `--threshold 0.45 --exit-threshold 0.40`.
 
 These four come from the model's **own paper position**, which may differ from yours.
 
-### The next-day suggestion
+### The decision
 
-`stock_cli.py` asks whether you own the stock and applies the same rule to **your** position:
+`stock_cli.py` asks whether you own the stock and shows **two calls** for **your** position:
 
-| You | Smoothed P(up) | Suggestion |
+| You | Signal call (smoothed P(up)) | Forecast call (next close P50 vs last price) |
 |---|---|---|
-| don't own it | above entry (0.55) | **BUY** |
-| don't own it | entry or below | **WAIT – don't buy** |
-| own it | exit (0.50) or above | **HOLD** |
-| own it | below exit | **SELL** |
+| don't own it | **BUY** above entry (0.55), else **WAIT** | **BUY** above +0.40% (round-trip cost), else **WAIT** |
+| own it | **SELL** below exit (0.50), else **HOLD** | **SELL** below −0.25% (selling cost), else **HOLD** |
+
+The forecast call uses whichever next-session model (LSTM or LightGBM) has the best test skill
+on the close; if neither beats the baseline it has no view and says WAIT / HOLD.
+
+**The decision (`>>>`) only trades when both calls agree.** If they disagree you keep your
+current position (WAIT if out, HOLD if in), and both calls are logged so the record shows
+which one is worth following.
+
+**When you run it decides what it's for (WIB):**
+
+| Run at | Decision is for | Extra lines |
+|---|---|---|
+| before 08:45 | today's session | today's expected open and close range |
+| 09:00–16:00 | today's pre-closing (PROVISIONAL, on the live price) | today's close range from the live price; tomorrow's ranges (provisional) |
+| 16:00–16:15 | nothing new: the closing auction is running | |
+| after 16:15 | the next session | next session's open and close range |
 
 **Prices:**
-- **Main price = the last price.** The backtest assumes you trade at the close, so the closest real-world equivalent is the **pre-closing session (15:50–16:00 WIB)**. If the tool is run after the close, the suggestion is for the next trading day.
-- **Patient limit**: the LSTM's next-session median, rounded to the IDX tick. It's cheaper (BUY) or higher (SELL) than the last price but **may not fill**.
-- **Range low / high**: edges of the next-session 80% range. They are context, not targets.
+- **Main price = the last price.** The backtest assumes you trade at the close, so the closest real-world equivalent is the **pre-closing session (15:50–16:00 WIB)**.
+- **Patient limit**: the next-session close median, rounded to the IDX tick. It's cheaper (BUY) or higher (SELL) than the last price but **may not fill**.
+- **Ranges**: 80% ranges (P10–P90) for the open and close. Context, not targets.
+- **Last forecast check**: the latest evening forecast against what actually happened.
 
-If the summary says **PROVISIONAL**, it was built on an unfinished bar during market hours.
-Re-run after 16:15 WIB to confirm.
+**Speed:** heavy models train only on finished sessions and are cached once per close in
+`src/output/cache/`. The first run after a close takes a few minutes; later runs that day take
+seconds (about 15 s during the session, which adds a quick hourly model). `--refresh` retrains.
 
 ### LSTM forecast tables
 
@@ -319,21 +336,23 @@ The verdict line at the end says whether any model × horizon beats the baseline
 
 One row per stock, date and setting; re-running on the same day overwrites that row.
 Columns: `bar_date, ticker, model, horizon, entry, exit, smooth, close, p_up, p_smoothed,
-position, action, owned, advice, provisional, price_at, run_at`. Compare `action`/`advice`
-with what the price actually did over the following days before trusting the signal with money.
+position, action, owned, advice, signal_advice, forecast_advice, forecast_model, forecast_move,
+provisional, price_at, run_at`. `advice` is the decision; `signal_advice` and `forecast_advice`
+are the two calls. Compare them with what the price actually did over the following days
+before trusting either with money. Forecasts themselves go to `src/output/forecast_log.csv`.
 
 ---
 
 ## A daily routine
 
-1. After **16:15 WIB**, run `python stock_cli.py` and enter your stocks.
-2. Read the **SUMMARY** block: the suggestion, the price, and whether it's provisional.
-3. For BUY/SELL, place the order in the next pre-closing session (or at the open).
-4. Let the log build up for a few weeks, then compare its suggestions with what happened.
+1. After **16:15 WIB**, run `python stock_cli.py` and enter your stocks. This trains and caches the day's models and logs the evening forecast.
+2. Read the **SUMMARY** block: both calls, the decision, the prices.
+3. Before the open or during the day, run it again whenever you like (seconds). During the session it re-checks the decision on the live price and logs a close update.
+4. For BUY/SELL, place the order in the pre-closing session (15:50–16:00) or at the open.
+5. Let the logs build up for a few weeks, then compare the decisions and forecasts with what happened.
 
-To act **on the same day**, run it during **15:30–15:50 WIB** and trade in the pre-closing
-session. The signal is then provisional, but its price is close to the closing price the
-backtest assumes.
+To act **on the same day**, run it during **15:30–15:50 WIB**: the decision is provisional,
+but its price is close to the closing price the backtest assumes.
 
 ---
 

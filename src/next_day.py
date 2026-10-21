@@ -59,6 +59,7 @@ import torch
 import bbca_walkforward as wf
 import intraday_close as ic
 import lstm_forecast as lf
+import model_cache as mc
 import today_signal as ts
 from intraday_test import tick_size
 
@@ -100,9 +101,9 @@ def prepare(px: pd.DataFrame, mkt: pd.DataFrame | None, since: str) -> dict:
 # ----------------------------------------------------------------------------
 # Models: every predictor returns (n, 3 targets, 3 quantiles) of log returns in %
 # ----------------------------------------------------------------------------
-def lstm_predict(seq: pd.DataFrame, Y: np.ndarray, L: int, tr, va, tr_f, va_f, seeds) -> tuple[np.ndarray, np.ndarray]:
-    """Ensemble trained before the evaluation period -> predictions for every day;
-    a second ensemble refit on all data -> today's prediction."""
+def lstm_fit(seq: pd.DataFrame, Y: np.ndarray, L: int, tr, va, tr_f, va_f, seeds) -> tuple[np.ndarray, dict]:
+    """Ensemble trained before the evaluation period -> out-of-sample predictions for
+    every day; a second ensemble refit on all data, moved to the CPU for live forecasts."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     mu, sd = seq.iloc[: tr[-1] + 1].mean(), seq.iloc[: tr[-1] + 1].std().replace(0, 1)
     X = ((seq - mu) / sd).values
@@ -110,33 +111,46 @@ def lstm_predict(seq: pd.DataFrame, Y: np.ndarray, L: int, tr, va, tr_f, va_f, s
     k = len(TARGETS)                            # the LSTM's "days ahead" axis carries the 3 targets
     models = lf.ensemble(win, tr, va, X.shape[1], k, seeds)
     oos = lf.predict_all(models, win, len(seq), L, k)
-    final = lf.ensemble(win, tr_f, va_f, X.shape[1], k, seeds)
-    return oos, lf.predict(final, win, [len(seq) - 1])[0]
+    final = [m.cpu() for m in lf.ensemble(win, tr_f, va_f, X.shape[1], k, seeds)]
+    return oos, {"models": final, "mu": mu, "sd": sd, "L": L}
 
 
-def lgbm_fit_predict(F: pd.DataFrame, Y: np.ndarray, train_idx, pred_idx, seed: int) -> np.ndarray:
+def lstm_last(st: dict, seq: pd.DataFrame) -> np.ndarray:
+    """(3 targets, 3 quantiles) from the last L days of `seq`."""
+    x = torch.tensor(((seq.iloc[-st["L"]:] - st["mu"]) / st["sd"]).values[None], dtype=torch.float32)
+    with torch.no_grad():
+        return np.mean([m(x).numpy() for m in st["models"]], axis=0)[0]
+
+
+def lgbm_fit(F: pd.DataFrame, Y: np.ndarray, train_idx, seed: int) -> list[list]:
+    """One quantile model per target x quantile."""
     from lightgbm import LGBMRegressor
 
-    out = np.empty((len(pred_idx), len(TARGETS), len(lf.QUANTILES)))
+    out = []
     for j in range(len(TARGETS)):
-        for k, q in enumerate(lf.QUANTILES):
+        row = []
+        for q in lf.QUANTILES:
             m = LGBMRegressor(objective="quantile", alpha=q, n_estimators=200, learning_rate=0.03,
                               num_leaves=15, max_depth=4, min_child_samples=50, subsample=0.8,
                               subsample_freq=1, colsample_bytree=0.7, random_state=seed, verbose=-1)
-            m.fit(F.iloc[train_idx], Y[train_idx, j])
-            out[:, j, k] = m.predict(F.iloc[pred_idx])
-    return np.sort(out, axis=-1)
+            row.append(m.fit(F.iloc[train_idx], Y[train_idx, j]))
+        out.append(row)
+    return out
+
+
+def lgbm_predict(models: list[list], X: pd.DataFrame) -> np.ndarray:
+    out = np.array([[m.predict(X) for m in row] for row in models])      # (targets, quantiles, n)
+    return np.sort(out.transpose(2, 0, 1), axis=-1)
 
 
 def lgbm_walk_forward(F: pd.DataFrame, Y: np.ndarray, valid: np.ndarray, first: int,
                       retrain: int, seed: int) -> np.ndarray:
     """Expanding window from day `first`, retrained every `retrain` days on the days
-    whose outcome was known; the last day (today) gets a model fit on everything."""
+    whose outcome was known."""
     n = len(F)
     pred = np.full((n, len(TARGETS), len(lf.QUANTILES)), np.nan)
     for s in range(first, n, retrain):
-        pred[s:min(s + retrain, n)] = lgbm_fit_predict(F, Y, valid[valid < s], np.arange(s, min(s + retrain, n)), seed)
-    pred[n - 1] = lgbm_fit_predict(F, Y, valid, [n - 1], seed)[0]
+        pred[s:min(s + retrain, n)] = lgbm_predict(lgbm_fit(F, Y, valid[valid < s], seed), F.iloc[s:min(s + retrain, n)])
     return pred
 
 
@@ -185,10 +199,11 @@ def evaluate(preds: dict[str, np.ndarray], Y: np.ndarray, rows: np.ndarray) -> p
 # ----------------------------------------------------------------------------
 # Main computation
 # ----------------------------------------------------------------------------
-def run(px: pd.DataFrame, mkt: pd.DataFrame | None, label: str, L: int = 60, n_seeds: int = 3,
+def fit(px: pd.DataFrame, mkt: pd.DataFrame | None, label: str, L: int = 60, n_seeds: int = 3,
         test_days: int = 500, calib_window: int = 250, gamma: float = 0.005, retrain: int = 21,
         since: str = "2013-01-01", seed: int = 42) -> dict:
-    """Evaluate all models on the last `test_days` closes, then forecast the next session."""
+    """Train on finished sessions and evaluate every model on the last `test_days` of them.
+    Callers cache the result per close; forecast() applies it to the latest bar."""
     d = prepare(px, mkt, since)
     Y, sigma, n = d["Y"], d["sigma"], len(d["Y"])
     valid = np.arange(L - 1, n)[~np.isnan(Y[L - 1:]).any(axis=1)]
@@ -205,15 +220,17 @@ def run(px: pd.DataFrame, mkt: pd.DataFrame | None, label: str, L: int = 60, n_s
 
     t0 = time.time()
     print(f"  LSTM ({n_seeds} seeds x 2 fits) ...", flush=True)
-    lstm_oos, lstm_now = lstm_predict(d["seq"], Y, L, pre[:-n_va], pre[-n_va:],
-                                      valid[: len(valid) - n_va_f], valid[-n_va_f:], list(range(n_seeds)))
+    lstm_oos, lstm_st = lstm_fit(d["seq"], Y, L, pre[:-n_va], pre[-n_va:],
+                                 valid[: len(valid) - n_va_f], valid[-n_va_f:], list(range(n_seeds)))
     print(f"  LightGBM walk-forward ({len(TARGETS) * len(lf.QUANTILES)} quantile models, "
           f"retrained every {retrain} days) ...", flush=True)
     lgbm = lgbm_walk_forward(d["tree"], Y, valid, first, retrain, seed)
+    lgbm_final = lgbm_fit(d["tree"], Y, valid, seed)
     t_fit = time.time() - t0
 
-    # calibrate on resolved misses; today's LSTM forecast (refit model) borrows the
-    # shift learned from the first ensemble's out-of-sample errors
+    # calibrate on resolved misses. The shift for the last finished day uses misses
+    # resolved by its close, which is also all that's known during the next session,
+    # so live forecasts reuse it; the refit LSTM borrows the first ensemble's shift
     adj_lstm = conformal_shift(lstm_oos, Y, sigma, first, calib_window, gamma)
     adj_lgbm = conformal_shift(lgbm, Y, sigma, first, calib_window, gamma)
     preds = {
@@ -221,13 +238,20 @@ def run(px: pd.DataFrame, mkt: pd.DataFrame | None, label: str, L: int = 60, n_s
         "LightGBM": shifted(lgbm, adj_lgbm, sigma),
         "Baseline": baseline(sigma),
     }
-    now = {
-        "LSTM": shifted(lstm_now[None], adj_lstm[[n - 1]], sigma[[n - 1]])[0],
-        "LightGBM": preds["LightGBM"][n - 1],
-        "Baseline": preds["Baseline"][n - 1],
-    }
-    return {"label": label, "px": d["px"], "ev": evaluate(preds, Y, te), "now": now,
-            "n_test": len(te), "t_fit": t_fit}
+    return {"label": label, "since": since, "fit_date": idx[-1], "ev": evaluate(preds, Y, te),
+            "n_test": len(te), "t_fit": t_fit, "lstm": lstm_st, "lgbm": lgbm_final,
+            "adj": {"LSTM": adj_lstm[n - 1], "LightGBM": adj_lgbm[n - 1]}}
+
+
+def forecast(state: dict, px: pd.DataFrame, mkt: pd.DataFrame | None) -> dict:
+    """Next-session forecast from the last bar of `px` (final or live) with fitted models."""
+    d = prepare(px, mkt, state["since"])
+    sig = d["sigma"][[-1]]
+    raw = {"LSTM": lstm_last(state["lstm"], d["seq"]), "LightGBM": lgbm_predict(state["lgbm"], d["tree"].iloc[[-1]])[0]}
+    now = {m: shifted(p[None], state["adj"][m][None], sig)[0] for m, p in raw.items()}
+    now["Baseline"] = baseline(sig)[0]
+    return {"label": state["label"], "px": d["px"], "ev": state["ev"], "now": now,
+            "n_test": state["n_test"], "t_fit": state["t_fit"]}
 
 
 # ----------------------------------------------------------------------------
@@ -484,25 +508,65 @@ def report_intraday(ir: dict, prev_date: pd.Timestamp, log: pd.DataFrame | None)
             print("  close error = average |actual close / P50 - 1|; inside 80% should be ~80%.")
 
 
-def run_intraday(a: argparse.Namespace, cfg: wf.Config, px: pd.DataFrame) -> None:
-    """Session in progress: update today's close forecast from the live price and log it."""
-    t0 = time.time()
+# ----------------------------------------------------------------------------
+# Entry points shared with stock_cli.py: heavy fits are cached per close
+# ----------------------------------------------------------------------------
+def finished(px: pd.DataFrame, mkt: pd.DataFrame | None) -> tuple[pd.DataFrame, pd.DataFrame | None, pd.Timestamp]:
+    """Drop today's unfinished bar, so models only ever train on finished sessions."""
+    if px.attrs.get("provisional"):
+        px = px.iloc[:-1]
+    day = px.index[-1]
+    return px, None if mkt is None else mkt[mkt.index <= day], day
+
+
+def next_session(px: pd.DataFrame, mkt: pd.DataFrame | None, label: str, refresh: bool = False, **kw) -> dict:
+    """Next-session forecast from the latest bar (final, or live = provisional).
+    `kw` goes to fit(); the fit is cached per close date."""
+    px_f, mkt_f, day = finished(px, mkt)
+    state, hit = mc.cached("next_day", label, day, kw, lambda: fit(px_f, mkt_f, label, **kw), refresh)
+    if hit:
+        print(f"  using the models fitted after the {day:%Y-%m-%d} close (cached)")
+    return forecast(state, px, mkt)
+
+
+def intraday_now(px: pd.DataFrame, cfg: wf.Config, offline: bool, refresh: bool = False) -> dict:
+    """Today's close forecast from the live price in px (patched by today_signal.load)."""
     live_at = pd.Timestamp(px.attrs["live_at"])
     if px.index[-1].date() != live_at.date():
         raise SystemExit("No bar for today yet; intraday mode needs today's open.")
-    prev_date, prev_close = px.index[-2], float(px["Close"].iloc[-2])
-    print("Intraday close forecast (hourly LightGBM walk-forward) ...", flush=True)
-    ir = ic.run(cfg.ticker, None if cfg.market.lower() == "none" else cfg.market, cfg.data_dir, live_at,
-                float(px["Close"].iloc[-1]), float(px["Open"].iloc[-1]), prev_close, offline=a.offline)
+    h_all, mkt_h = ic.load(cfg.ticker, None if cfg.market.lower() == "none" else cfg.market, cfg.data_dir, offline)
+    state, hit = mc.cached("intraday", cfg.ticker, px.index[-2], {},
+                           lambda: ic.fit(h_all, mkt_h, live_at.date(), cfg.ticker), refresh)
+    if hit:
+        print("  using today's hourly model (cached)")
+    return ic.predict(state, h_all, mkt_h, live_at, float(px["Close"].iloc[-1]), float(px["Open"].iloc[-1]),
+                      float(px["Close"].iloc[-2]))
+
+
+def update_log(path: Path, px: pd.DataFrame, ticker: str, provisional: bool, new: pd.DataFrame | None = None,
+               lock: bool = True) -> tuple[pd.DataFrame, bool]:
+    """Score what has happened since, add `new` rows (subject to the lock rule), save."""
+    log = fill_actuals(read_log(path), px[px["Volume"] > 0], ticker, provisional)
+    ok = False
+    if new is not None:
+        log, ok = merge_rows(log, new, datetime.now(ts.JKT), lock)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log.to_csv(path, index=False)
+    return log, ok
+
+
+def run_intraday(a: argparse.Namespace, cfg: wf.Config, px: pd.DataFrame) -> None:
+    """Session in progress: update today's close forecast from the live price and log it."""
+    t0 = time.time()
+    print("Intraday close forecast (hourly LightGBM) ...", flush=True)
+    ir = intraday_now(px, cfg, a.offline, a.refresh)
+    prev_date = px.index[-2]
 
     log, status = None, ""
     if not a.no_log:
-        path, now = Path(a.log), datetime.now(ts.JKT)
-        log = fill_actuals(read_log(path), px[px["Volume"] > 0], cfg.ticker, provisional=True)
-        log, _ = merge_rows(log, intraday_rows(ir, prev_date, now), now, lock=False)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        log.to_csv(path, index=False)
-        status = f"Logged the {live_at:%H:%M} update (scored after today's close)."
+        log, _ = update_log(Path(a.log), px, cfg.ticker, True,
+                            intraday_rows(ir, prev_date, datetime.now(ts.JKT)), lock=False)
+        status = f"Logged the {ir['live_at']:%H:%M} update (scored after today's close)."
 
     report_intraday(ir, prev_date, log)
     if status:
@@ -529,6 +593,7 @@ def main() -> None:
     ap.add_argument("--log", default=str(LOG))
     ap.add_argument("--mode", default="auto", choices=("auto", "overnight", "intraday"),
                     help="auto = intraday during the session (09:00-16:00 WIB), overnight otherwise")
+    ap.add_argument("--refresh", action="store_true", help="retrain instead of using today's cached models")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -543,26 +608,22 @@ def main() -> None:
         return run_intraday(a, cfg, px)
     mkt = None if cfg.market.lower() == "none" else ts.load(cfg.market, cfg, a.offline)
 
-    r = run(px, mkt, cfg.ticker, a.lookback, a.seeds, a.test_days, a.calib_window, a.gamma, since=a.since)
+    r = next_session(px, mkt, cfg.ticker, a.refresh, L=a.lookback, n_seeds=a.seeds, test_days=a.test_days,
+                     calib_window=a.calib_window, gamma=a.gamma, since=a.since)
 
     log, status = None, ""
     if not a.no_log:
-        path, now = Path(a.log), datetime.now(ts.JKT)
-        log = fill_actuals(read_log(path), r["px"], cfg.ticker, provisional)
-        if provisional:
-            status = "Not logged: the session isn't finished. Re-run after 16:15 WIB."
-        else:
-            log, ok = merge_rows(log, forecast_rows(r, now), now)
-            day = f"{r['px'].index[-1]:%Y-%m-%d}"
-            status = (f"Logged the forecast from the {day} close." if ok else
-                      f"Not logged: the session after {day} has already opened (locked at 08:45 WIB).")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        log.to_csv(path, index=False)
+        new = None if provisional else forecast_rows(r, datetime.now(ts.JKT))
+        log, ok = update_log(Path(a.log), px, cfg.ticker, provisional, new)
+        day = f"{r['px'].index[-1]:%Y-%m-%d}"
+        status = ("Not logged: the session isn't finished. Re-run after 16:15 WIB." if provisional else
+                  f"Logged the forecast from the {day} close." if ok else
+                  f"Not logged: the session after {day} has already opened (locked at 08:45 WIB).")
 
     report(r, log, provisional)
     if status:
         print(f"\n  {status}\n  Log: {Path(a.log).resolve()}")
-    print(f"  ({time.time() - t0:.0f}s, models {r['t_fit']:.0f}s)")
+    print(f"  ({time.time() - t0:.0f}s)")
 
 
 if __name__ == "__main__":
