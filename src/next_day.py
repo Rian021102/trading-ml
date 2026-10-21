@@ -253,7 +253,36 @@ def forecast(state: dict, px: pd.DataFrame, mkt: pd.DataFrame | None) -> dict:
     now = {m: shifted(p[None], state["adj"][m][None], sig)[0] for m, p in raw.items()}
     now["Baseline"] = baseline(sig)[0]
     return {"label": state["label"], "px": d["px"], "ev": state["ev"], "now": now,
-            "n_test": state["n_test"], "t_fit": state["t_fit"]}
+            "n_test": state["n_test"], "t_fit": state["t_fit"], "oos": state.get("oos")}
+
+
+LIMITS = {"buy at open P10": ("buy", 0), "buy at open P50": ("buy", 1),
+          "sell at open P50": ("sell", 1), "sell at open P90": ("sell", 2)}
+
+
+def limit_check(o: dict, px: pd.DataFrame, model: str) -> pd.DataFrame:
+    """Limit orders at the forecast open range, replayed on the test days: placed after
+    close t for session t+1. A buy fills if the day's low reaches it (at the open if it
+    gaps through), a sell if the high does. 'better than' = average price advantage
+    on the days it filled, vs trading at that session's open / close instead."""
+    p = o["preds"][model][:, TARGETS.index("gap")]
+    te = o["test"]
+    nxt = px[["Open", "High", "Low", "Close"]].reindex(o["index"]).shift(-1).iloc[te]
+    op, hi, lo, cl = (nxt[c].values for c in ("Open", "High", "Low", "Close"))
+    ref = o["close"][te]
+    rows = {}
+    for name, (side, k) in LIMITS.items():
+        lim = ref * np.exp(p[te, k] / 100)
+        if side == "buy":
+            fill, price = lo <= lim, np.minimum(op, lim)
+            vs_open, vs_close = op / price - 1, cl / price - 1
+        else:
+            fill, price = hi >= lim, np.maximum(op, lim)
+            vs_open, vs_close = price / op - 1, price / cl - 1
+        rows[name] = {"fills": fill.mean(),
+                      "better than open": vs_open[fill].mean() if fill.any() else np.nan,
+                      "better than close": vs_close[fill].mean() if fill.any() else np.nan}
+    return pd.DataFrame(rows).T
 
 
 # ----------------------------------------------------------------------------

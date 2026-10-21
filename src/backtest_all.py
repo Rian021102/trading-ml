@@ -218,6 +218,15 @@ def main() -> None:
           f"{((p.reindex(dates) > 0.5) == (fwd_up == 1)).mean():.0%} | LightGBM forecast {hit_fc:.0%}")
     print(f"  stock_cli's decision = 'Both agree ({m_live})' row. Starts out of the stock on {dates[0]:%Y-%m-%d}.")
 
+    m_open = sc.best_model(st["ev"], "open")
+    nd.section(f"2b. Limit prices for the next session ({m_open} open range), same {len(dates)} sessions")
+    lim = pd.concat({m: nd.limit_check(o, px_f, m) for m in dict.fromkeys((m_open, "Baseline"))},
+                    names=["range from", "order"])
+    print(nd.pct_table(lim, signed=("better than open", "better than close")))
+    print("  Order placed after the close for the whole next session. fills = share of sessions it filled;")
+    print("  better than open / close = average price advantage on those days vs trading at that open / close.")
+    print("  stock_cli uses 'buy at open P10' as its BUY price and 'sell at open P50' as its SELL price.")
+
     # ================= 3. intraday =================
     live_today = px.attrs.get("provisional") and px.index[-1].date() == now.date()
     try:

@@ -229,6 +229,11 @@ def combine(owned: bool, a: str, b: str) -> tuple[str, str]:
     return ("HOLD" if owned else "WAIT - don't buy"), "the calls disagree, so no new trade"
 
 
+def band(q: np.ndarray) -> str:
+    """P10 - P90 and the median, rounded to the IDX tick."""
+    return f"{to_tick(q[0], up=False):,.0f} - {to_tick(q[2], up=True):,.0f}, median {nd.to_tick(q[1], 'near'):,.0f}"
+
+
 def signal_fit(px: pd.DataFrame, mkt: pd.DataFrame, cfg: wf.Config) -> dict:
     """Walk-forward P(up) history, final classifiers (for today's and live rows) and GARCH
     volatility, all on finished sessions. Cached per close."""
@@ -408,43 +413,53 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool) -> None:
     print(f"  You {'own' if owned else 'do not own'} it. Decision for {when}:\n")
     print(f"  {'Signal call':<15}{s_call:<18}{s_why}")
     print(f"  {'Forecast call':<15}{f_call:<18}{f_why}")
-    print(f"\n  >>> {call}  ({why})"
-          + (f"  ({size:.0%} of the money you'd put in this stock)" if call == "BUY" else ""))
-
+    # one price per action. Today: the expected close, as a limit in the closing auction.
+    # Tomorrow: the limits that held up in backtest_all.py - buy at the low end of the
+    # open range, sell at its median - each placed for the whole session
     ci = nd.TARGETS.index("close")
     m_close, m_open = best_model(fc["ev"], "close"), best_model(fc["ev"], "open")
     c_q = last * np.exp(fc["now"][m_close][ci] / 100)
     o_q = last * np.exp(fc["now"][m_open][nd.TARGETS.index("gap")] / 100)
-    if call == "BUY":
-        print(f"\n  Buy price : around {last:,.0f} - the price the signal backtest assumes.")
-        print(f"              patient limit {to_tick(min(c_q[1], last), up=False):,.0f} "
-              f"(next close median; fills only on a dip), range low {to_tick(c_q[0], up=False):,.0f}")
-    elif call == "SELL":
-        print(f"\n  Sell price: around {last:,.0f} - the price the signal backtest assumes.")
-        print(f"              patient limit {to_tick(max(c_q[1], last), up=True):,.0f} "
-              f"(next close median; fills only on a bounce), range high {to_tick(c_q[2], up=True):,.0f}")
-    elif s_call != f_call:
-        print("\n  No order. Re-run later: the decision trades once both calls point the same way.")
-    elif call == "HOLD":
-        print(f"\n  No order. The signal turns SELL once smoothed P(up) drops below {cfg.exit_threshold}.")
+    lim = nd.limit_check(fc["oos"], fc["px"], m_open) if fc.get("oos") is not None else None
+    fills = {"BUY": "buy at open P10", "SELL": "sell at open P50"}
+    tom = {"BUY": to_tick(o_q[0], up=False), "SELL": nd.to_tick(o_q[1], "near")}
+    tom_txt = {k: f"{k} at {v:,.0f}" + ("" if lim is None else f" (filled {lim.at[fills[k], 'fills']:.0%} of test days)")
+               for k, v in tom.items()}
+    t = None
+    if ir is not None:
+        m_now = "LightGBM" if ir["ev"]["skill"].get((ir["checkpoint"], "LightGBM"), 0.0) > 0 else "Baseline"
+        t = ir["now"][m_now]
+        order = {k: f"{k} at {nd.to_tick(t[1], 'near'):,.0f}  - limit in today's closing auction, 15:50-16:00"
+                 for k in ("BUY", "SELL")}
+    elif not provisional:
+        order = {k: f"{tom_txt[k]}  - limit order for {nxt:%a %d %b}" for k in ("BUY", "SELL")}
     else:
-        print(f"\n  No order. The signal turns BUY once smoothed P(up) rises above {cfg.prob_threshold}.")
+        order = {k: f"{k}  - price after the 16:15 run" for k in ("BUY", "SELL")}
+
+    if call in order:
+        print(f"\n  >>> {order[call]}"
+              + (f"  ({size:.0%} of the money you'd put in this stock)" if call == "BUY" else ""))
+        print(f"      ({why})")
+    else:
+        turn = "SELL" if owned else "BUY"
+        print(f"\n  >>> {call}  ({why})")
+        print(f"      If it turns {turn}: {order[turn]}")
+        if s_call != f_call:
+            print("      Re-run later: the decision trades once both calls point the same way.")
+
+    print()
+    if t is not None:
+        print(f"  {'Today close 80% range':<26}: {band(t)} ({m_now}, from {ir['price']:,.0f} at {ir['live_at']:%H:%M})")
+    lbl = "Tomorrow (prov.)" if provisional else f"{nxt:%a %d %b}"
+    print(f"  {lbl + ' open 80%':<26}: {band(o_q)} ({m_open})")
+    print(f"  {lbl + ' close 80%':<26}: {band(c_q)} ({m_close})")
+    print(f"  {lbl + ' prices':<26}: {tom_txt['BUY']} | {tom_txt['SELL']}")
 
     model_owns = cur_pos > 0
     print(f"\n  Model's own paper position: {act} (P(up) today {p.iloc[-1]:.3f})"
           + ("" if model_owns == owned else
              f"\n  Note: the model is {'in' if model_owns else 'out of'} the stock but you are "
              f"{'in' if owned else 'out'}; the calls above use YOUR position."))
-    if ir is not None:
-        m_now = "LightGBM" if ir["ev"]["skill"].get((ir["checkpoint"], "LightGBM"), 0.0) > 0 else "Baseline"
-        t = ir["now"][m_now]
-        print(f"  {'Today close 80% range':<26}: {to_tick(t[0], up=False):,.0f} - {to_tick(t[2], up=True):,.0f}, "
-              f"median {nd.to_tick(t[1], 'near'):,.0f} ({m_now}, from {ir['price']:,.0f} at {ir['live_at']:%H:%M})")
-    lbl = "Tomorrow (prov.)" if provisional else f"{nxt:%a %d %b}"
-    print(f"  {lbl + ' open 80%':<26}: {to_tick(o_q[0], up=False):,.0f} - {to_tick(o_q[2], up=True):,.0f}, "
-          f"median {nd.to_tick(o_q[1], 'near'):,.0f} ({m_open})")
-    print(f"  {lbl + ' close 80%':<26}: {to_tick(c_q[0], up=False):,.0f} - {to_tick(c_q[2], up=True):,.0f}, "
-          f"median {nd.to_tick(c_q[1], 'near'):,.0f} ({m_close})")
     if r is not None:
         e = r["fc"].iloc[-1]
         print(f"  {f'{a.days}-day 80% range':<26}: {e.lstm_p10:,.0f} - {e.lstm_p90:,.0f}, "
