@@ -247,10 +247,12 @@ def signal_probs(sig: dict, df: pd.DataFrame) -> pd.DataFrame:
     """Walk-forward history, with the last finished day and any live day predicted
     by the final classifiers (same as today_signal.refit_last)."""
     probs = sig["probs"].copy()
-    rows = df.dropna(subset=sig["cols"])
+    # a live bar can lack a feature (e.g. close_loc when only one price has traded, so
+    # High == Low); carry the previous day's value instead of silently dropping today
+    rows = df[sig["cols"]].ffill()
     new = rows.index[rows.index >= probs.index[-1]]
     for c, m in sig["models"].items():
-        p = pd.Series(m.predict_proba(rows.loc[new, sig["cols"]])[:, 1], index=new)
+        p = pd.Series(m.predict_proba(rows.loc[new])[:, 1], index=new)
         probs = probs.reindex(probs.index.union(new))
         probs.loc[new, c] = p
     return probs
