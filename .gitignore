@@ -19,3 +19,4 @@ images/
 src/output/*
 # ...except the paper-trading log, which can't be regenerated
 !src/output/signals_log.csv
+!src/output/forecast_log.csv
