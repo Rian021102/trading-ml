@@ -33,7 +33,7 @@ look-ahead bias, gives a daily **BUY / HOLD / SELL** suggestion, and forecasts a
 | `bbca_walkforward.py` | The engine: data download, features, walk-forward models, backtest, HTML report. Other scripts import it. | ~1 min |
 | `today_signal.py` | Today's BUY / SELL / HOLD / STAY OUT for one stock, logged for paper-trading. | ~1 min |
 | `lstm_forecast.py` | LSTM forecast of the 80% price range for the next 20 trading days, with an honesty check. | ~2 min (GPU) |
-| `next_day.py` | *Trial (BBCA).* Next session's open and close as 80% ranges (LSTM, LightGBM, baseline), logged and scored against what happened. Run after 16:15 WIB. | ~1 min |
+| `next_day.py` | *Trial (BBCA).* After 16:15 WIB: next session's open and close as 80% ranges (LSTM, LightGBM, baseline). During the session: today's close updated from the live price (`intraday_close.py`). Every forecast is logged and scored against what happened. | ~1 min / ~30 s |
 | `sweep.py` | Tries hundreds of settings (horizon × thresholds × smoothing × model). | 5–15 min |
 | `holdout.py` | Checks whether the sweep's best settings keep working on data they weren't picked on. | 5–15 min |
 | `intraday_test.py` | Tests whether an *hourly* forecaster would make money after costs (answer so far: no). | ~1 min |

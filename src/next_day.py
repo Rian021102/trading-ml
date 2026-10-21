@@ -2,7 +2,13 @@
 Next-session open & close forecast, with a scorecard
 ====================================================
 
-Run it after the close (16:15 WIB). For the next session it forecasts:
+Run it after the close (16:15 WIB), and during the session as often as you
+like. During the session (09:00-16:00 WIB) it switches to intraday mode: the
+open is known, so it updates the forecast for today's close from the latest
+price (intraday_close.py) and logs every run. The time-of-day scorecard then
+shows how much each update improved on the evening forecast.
+
+After the close, for the next session it forecasts:
 
   gap    = log(next open  / today's close)    -> next OPEN price
   intra  = log(next close / next open)        -> kept for the intraday update (phase 2)
@@ -22,17 +28,21 @@ actually happened and prints how far off each model was, plus a scorecard over
 the last 20 / 60 scored sessions. That log is the real test: unlike a backtest
 it can't peek at the future.
 
-Log rules: one row per close date x model. A row can be overwritten until
+Log rules: one evening row per close date x model. It can be overwritten until
 08:45 WIB of the next weekday (the pre-opening auction), then it is locked.
-Runs on an unfinished bar (market open, or before 16:15) are shown but not
-logged. Prices are stored as returns plus the close they start from, so
-Yahoo's dividend re-adjustment of old prices doesn't shift the comparison.
+Intraday rows are added per run (keyed by the time of the price used), with
+bar_date = the previous close, so evening and intraday forecasts of the same
+session line up. Between 16:00 and 16:15 nothing is logged. Prices are stored
+as returns plus the close they start from, so Yahoo's dividend re-adjustment
+of old prices doesn't shift the comparison.
 
-    python next_day.py                      # BBCA.JK
+    python next_day.py                      # BBCA.JK, mode picked from the clock
     python next_day.py --ticker BBRI.JK --seeds 2
     python next_day.py --offline --no-log   # saved CSVs, don't touch the log
+    python next_day.py --mode overnight     # evening forecast even during the session (not logged)
 
-Takes ~2-3 min (LSTM ensemble on a GPU, LightGBM walk-forward on the CPU).
+Takes ~1 min after the close (LSTM ensemble on a GPU, LightGBM walk-forward on
+the CPU), ~15 s during the session.
 """
 
 from __future__ import annotations
@@ -47,6 +57,7 @@ import pandas as pd
 import torch
 
 import bbca_walkforward as wf
+import intraday_close as ic
 import lstm_forecast as lf
 import today_signal as ts
 from intraday_test import tick_size
@@ -54,8 +65,9 @@ from intraday_test import tick_size
 TARGETS = ("gap", "intra", "close")          # next-session log returns, in %
 MODELS = ("LSTM", "LightGBM", "Baseline")
 PRE_OPEN = dtime(8, 45)                      # IDX pre-opening auction starts; log rows lock here
+SESSION = (dtime(9, 0), dtime(16, 0))        # intraday mode between these (WIB)
 LOG = Path(__file__).resolve().parent / "output" / "forecast_log.csv"
-LOG_KEYS = ["bar_date", "ticker", "model", "stage"]
+LOG_KEYS = ["bar_date", "ticker", "model", "stage", "as_of"]
 
 
 # ----------------------------------------------------------------------------
@@ -266,28 +278,66 @@ def fill_actuals(log: pd.DataFrame, px: pd.DataFrame, ticker: str, provisional: 
     return log
 
 
+def intraday_rows(ir: dict, prev_date: pd.Timestamp, made_at: datetime) -> pd.DataFrame:
+    """Intraday forecasts of today's close; bar_date/ref_close = the previous close,
+    like the evening rows for the same session."""
+    ref, rows = ir["prev_close"], []
+    for m, c in ir["now"].items():
+        row = {"bar_date": f"{prev_date:%Y-%m-%d}", "ticker": ir["label"], "model": m, "stage": "intraday",
+               "as_of": f"{ir['live_at']:%Y-%m-%d %H:%M}", "ref_close": round(ref, 2),
+               "price_at": round(ir["price"], 2)}
+        for k, p in enumerate((10, 50, 90)):
+            row[f"r_close_p{p}"] = round(float(np.log(c[k] / ref) * 100), 4)
+            row[f"close_p{p}"] = round(float(c[k]), 2)
+        row["made_at"] = made_at.strftime("%Y-%m-%d %H:%M WIB")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
 def read_log(path: Path) -> pd.DataFrame:
-    cols = ["next_date", "actual_open", "actual_close"] + [f"r_{t}_actual" for t in TARGETS]
+    cols = ["as_of", "price_at", "next_date", "actual_open", "actual_close"] + [f"r_{t}_actual" for t in TARGETS]
     log = pd.read_csv(path) if path.exists() else pd.DataFrame(columns=LOG_KEYS)
     for c in cols:
         if c not in log:
             log[c] = np.nan
-    return log.astype({"next_date": object})
+    return log.astype({"next_date": object, "as_of": object})
 
 
-def merge_rows(log: pd.DataFrame, new: pd.DataFrame, now: datetime) -> tuple[pd.DataFrame, bool]:
-    """Insert or replace today's rows unless the forecast window has closed."""
-    if now >= lock_time(new["bar_date"].iloc[0]):
+def merge_rows(log: pd.DataFrame, new: pd.DataFrame, now: datetime, lock: bool = True) -> tuple[pd.DataFrame, bool]:
+    """Insert or replace rows with the same key; evening rows only until their lock time."""
+    if lock and now >= lock_time(new["bar_date"].iloc[0]):
         return log, False
     if log.empty:
         return new.reindex(columns=list(dict.fromkeys([*new.columns, *log.columns]))), True
-    key =lambda df: df[LOG_KEYS].astype(str).agg("|".join, axis=1)
+    key = lambda df: df.reindex(columns=LOG_KEYS).fillna("").astype(str).agg("|".join, axis=1)
     log = pd.concat([log[~key(log).isin(key(new))], new], ignore_index=True)
-    return log.sort_values(["ticker", "bar_date", "model"], kind="stable").reset_index(drop=True), True
+    return log.sort_values(["ticker", "bar_date", "stage", "as_of", "model"], kind="stable",
+                           na_position="first").reset_index(drop=True), True
 
 
 def scored(log: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return log[(log["ticker"] == ticker) & (log["stage"] == "overnight") & log["next_date"].notna()]
+
+
+def stage_scorecard(log: pd.DataFrame, ticker: str, last: int = 20) -> pd.DataFrame | None:
+    """Close-forecast error by when it was made: the evening before, then each hour of the session."""
+    s = log[(log["ticker"] == ticker) & log["next_date"].notna()]
+    if not (s["stage"] == "intraday").any():
+        return None
+    s = s[s["bar_date"].isin(sorted(s["bar_date"].unique())[-last:])].copy()
+    s["when"] = np.where(s["stage"] == "overnight", "evening before",
+                         "run at " + s["as_of"].fillna("").str[11:13] + ":xx")
+    rows = []
+    for (when, m), g in s.groupby(["when", "model"], sort=False):
+        rows.append({
+            "when": when, "model": m, "runs": len(g),
+            "close error": (g["actual_close"] / g["close_p50"] - 1).abs().mean(),
+            "close inside 80%": g["actual_close"].between(g["close_p10"], g["close_p90"]).mean(),
+            "80% width": ((g["close_p90"] - g["close_p10"]) / g["close_p50"]).mean(),
+        })
+    out = pd.DataFrame(rows)
+    out["_o"] = out["when"].map(lambda w: "" if w.startswith("evening") else w)
+    return out.sort_values(["_o", "model"]).drop(columns="_o").set_index(["when", "model"])
 
 
 def scorecard(log: pd.DataFrame, ticker: str, windows=(20, 60)) -> pd.DataFrame | None:
@@ -329,6 +379,8 @@ def band_txt(p10: float, p50: float, p90: float) -> str:
 def pct_table(df: pd.DataFrame, signed: tuple[str, ...] = ()) -> str:
     show = df.copy().astype(object)
     for c in df.columns:
+        if pd.api.types.is_integer_dtype(df[c]):
+            continue
         show[c] = df[c].map(lambda v, c=c: "-" if pd.isna(v) else (f"{v:+.1%}" if c in signed else f"{v:.1%}"))
     return show.to_string()
 
@@ -395,6 +447,69 @@ def report(r: dict, log: pd.DataFrame | None, provisional: bool) -> None:
     print("  P10-P90 = 80% range, rounded to the IDX tick. Not financial advice.")
 
 
+def report_intraday(ir: dict, prev_date: pd.Timestamp, log: pd.DataFrame | None) -> None:
+    ticker, p, ref, op = ir["label"], ir["price"], ir["prev_close"], ir["open"]
+    section(f"{ticker} intraday update: today's close ({ir['live_at']:%a %Y-%m-%d})")
+    print(f"  Price {p:,.0f} at {ir['live_at']:%H:%M} WIB (Yahoo, ~10 min delayed) | open {op:,.0f} "
+          f"({op / ref - 1:+.1%}) | prev close {ref:,.0f} ({prev_date:%a %d %b}) | now {p / ref - 1:+.1%}")
+    print(f"  Last finished checkpoint: {ir['checkpoint']}. Typical move still to come today: "
+          f"+/-{ir['sig_rem']:.1%} (1 sd).\n")
+    print(f"  {'':<24}{'close P10   P50   P90':>24}  {'P50 vs now':>10}  {'P50 vs prev close':>17}")
+    if log is not None:
+        eve = log[(log["ticker"] == ticker) & (log["stage"] == "overnight")
+                  & (log["bar_date"] == f"{prev_date:%Y-%m-%d}")].set_index("model")
+        for m in [m for m in MODELS if m in eve.index]:
+            x = eve.loc[m]
+            print(f"  {'evening ' + m:<24}{band_txt(x.close_p10, x.close_p50, x.close_p90):>24}  "
+                  f"{x.close_p50 / p - 1:>+10.1%}  {x.close_p50 / ref - 1:>+17.1%}")
+    for m, c in ir["now"].items():
+        print(f"  {'now ' + m:<24}{band_txt(*c):>24}  {c[1] / p - 1:>+10.1%}  {c[1] / ref - 1:>+17.1%}")
+    print("  evening = forecast logged after yesterday's close; now = updated with today's open and price.")
+    skill = ir["ev"].xs("LightGBM", level="model")["skill"]
+    if (skill <= 0).all():
+        print("  LightGBM has not beaten the Baseline at any checkpoint in testing: read the Baseline row.\n"
+              "  It is logged anyway so the live scorecard can confirm or overturn that.")
+
+    section(f"Intraday test-period check ({ir['n_test']} sessions, by when the forecast is made)")
+    print(pct_table(ir["ev"], signed=("skill",)))
+    print("  skill > 0 = beats the Baseline (close = latest price +/- volatility left today).")
+
+    if log is not None:
+        section("Live scorecard by time of day (last 20 scored sessions)")
+        sc = stage_scorecard(log, ticker)
+        if sc is None:
+            print("  No scored intraday runs yet; they are scored once the session closes.")
+        else:
+            print(pct_table(sc))
+            print("  close error = average |actual close / P50 - 1|; inside 80% should be ~80%.")
+
+
+def run_intraday(a: argparse.Namespace, cfg: wf.Config, px: pd.DataFrame) -> None:
+    """Session in progress: update today's close forecast from the live price and log it."""
+    t0 = time.time()
+    live_at = pd.Timestamp(px.attrs["live_at"])
+    if px.index[-1].date() != live_at.date():
+        raise SystemExit("No bar for today yet; intraday mode needs today's open.")
+    prev_date, prev_close = px.index[-2], float(px["Close"].iloc[-2])
+    print("Intraday close forecast (hourly LightGBM walk-forward) ...", flush=True)
+    ir = ic.run(cfg.ticker, None if cfg.market.lower() == "none" else cfg.market, cfg.data_dir, live_at,
+                float(px["Close"].iloc[-1]), float(px["Open"].iloc[-1]), prev_close, offline=a.offline)
+
+    log, status = None, ""
+    if not a.no_log:
+        path, now = Path(a.log), datetime.now(ts.JKT)
+        log = fill_actuals(read_log(path), px[px["Volume"] > 0], cfg.ticker, provisional=True)
+        log, _ = merge_rows(log, intraday_rows(ir, prev_date, now), now, lock=False)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        log.to_csv(path, index=False)
+        status = f"Logged the {live_at:%H:%M} update (scored after today's close)."
+
+    report_intraday(ir, prev_date, log)
+    if status:
+        print(f"\n  {status}\n  Log: {Path(a.log).resolve()}")
+    print(f"  ({time.time() - t0:.0f}s)")
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -412,13 +527,21 @@ def main() -> None:
     ap.add_argument("--offline", action="store_true", help="use the CSVs in data/ instead of downloading")
     ap.add_argument("--no-log", action="store_true", help="don't read or write the forecast log")
     ap.add_argument("--log", default=str(LOG))
+    ap.add_argument("--mode", default="auto", choices=("auto", "overnight", "intraday"),
+                    help="auto = intraday during the session (09:00-16:00 WIB), overnight otherwise")
     a = ap.parse_args()
 
     t0 = time.time()
     cfg = wf.Config(ticker=a.ticker, market=a.market, start=a.start)
     px = ts.load(cfg.ticker, cfg, a.offline)
-    mkt = None if cfg.market.lower() == "none" else ts.load(cfg.market, cfg, a.offline)
     provisional = bool(px.attrs.get("provisional", False))
+    in_session = (px.attrs.get("live_at") is not None and provisional
+                  and SESSION[0] <= datetime.now(ts.JKT).time() < SESSION[1])
+    if a.mode == "intraday" or (a.mode == "auto" and in_session):
+        if px.attrs.get("live_at") is None:
+            raise SystemExit("Intraday mode needs today's live price: run it during the session, without --offline.")
+        return run_intraday(a, cfg, px)
+    mkt = None if cfg.market.lower() == "none" else ts.load(cfg.market, cfg, a.offline)
 
     r = run(px, mkt, cfg.ticker, a.lookback, a.seeds, a.test_days, a.calib_window, a.gamma, since=a.since)
 
