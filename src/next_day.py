@@ -240,7 +240,9 @@ def fit(px: pd.DataFrame, mkt: pd.DataFrame | None, label: str, L: int = 60, n_s
     }
     return {"label": label, "since": since, "fit_date": idx[-1], "ev": evaluate(preds, Y, te),
             "n_test": len(te), "t_fit": t_fit, "lstm": lstm_st, "lgbm": lgbm_final,
-            "adj": {"LSTM": adj_lstm[n - 1], "LightGBM": adj_lgbm[n - 1]}}
+            "adj": {"LSTM": adj_lstm[n - 1], "LightGBM": adj_lgbm[n - 1]},
+            # day-by-day test predictions, for backtest_all.py
+            "oos": {"index": idx, "close": d["px"]["Close"].values, "Y": Y, "preds": preds, "test": te}}
 
 
 def forecast(state: dict, px: pd.DataFrame, mkt: pd.DataFrame | None) -> dict:

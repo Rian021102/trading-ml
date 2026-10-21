@@ -220,7 +220,9 @@ def fit(h_all: pd.DataFrame, mkt_h: pd.DataFrame | None, today, label: str, test
     test = np.isin(days, all_days[-test_days:])
     return {"label": label, "cols": cols, "models": fit_models(X, z, seed), "shift": shift[None],
             "v_today": slot_variance(h).iloc[-1], "ev": evaluate(rows, preds, test),
-            "n_test": int(len(all_days[-test_days:]))}
+            "n_test": int(len(all_days[-test_days:])),
+            # row-by-row test predictions, for backtest_all.py
+            "oos": {"rows": rows[list(NOT_X)], "preds": preds, "test": test}}
 
 
 def predict(state: dict, h_all: pd.DataFrame, mkt_h: pd.DataFrame | None, live_at: pd.Timestamp,
