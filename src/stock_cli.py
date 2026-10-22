@@ -42,6 +42,11 @@ day out), and the take-profit widens to 2x the N-day volatility. In the
 2016-2026 replay 10 days beat 1 day on MTLA but lost to it on BBCA and BBRI,
 so pick it per stock: python backtest_all.py MTLA --horizon 10.
 
+The horizon is remembered per stock in stock_horizons.json: type "MTLA 10" at
+the prompt to run MTLA on 10 days and save it, "MTLA 1" to go back; plain
+"MTLA" uses the saved value (1 if none). --horizon N overrides it for one run
+without saving. backtest_all.py uses the same saved value.
+
 The LSTM 20-day median is shown next to the two calls but has no vote unless
 you pass --lstm-veto: it has no edge over a random walk, and in the replay
 vetoing BUYs on it cut returns.
@@ -56,7 +61,7 @@ Ctrl-C cancels a running analysis.
     python stock_cli.py
     python stock_cli.py MTLA BBCA                  # analyse these first, then prompt
     python stock_cli.py --no-lstm --no-open        # faster, don't open the chart
-    python stock_cli.py MTLA --horizon 10          # hold for weeks, not days
+    python stock_cli.py MTLA --horizon 10          # one run on 10 days, nothing saved
 
 sweep.py, holdout.py and intraday_test.py are research tools and are not run
 here. Every decision is appended to output/signals_log.csv, every forecast to
@@ -66,6 +71,7 @@ output/forecast_log.csv.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import select
@@ -88,6 +94,7 @@ import today_signal as ts
 from intraday_test import tick_size
 
 OUT_DIR = Path(__file__).resolve().parent / "output"
+HORIZONS = Path(__file__).resolve().parent / "stock_horizons.json"
 LINE = "=" * 72
 
 
@@ -182,6 +189,27 @@ def normalize(code: str) -> str | None:
     if "." not in t and not t.startswith("^"):
         t += ".JK"
     return t if re.fullmatch(r"\^?[A-Z0-9][A-Z0-9.\-]*", t) else None
+
+
+def saved_horizons() -> dict[str, int]:
+    try:
+        return {k: int(v) for k, v in json.loads(HORIZONS.read_text()).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def horizon_for(ticker: str, override: int | None) -> int:
+    """--horizon if given, else the one saved for this stock, else 1."""
+    return override if override is not None else saved_horizons().get(ticker, 1)
+
+
+def save_horizon(ticker: str, h: int) -> None:
+    hs = saved_horizons()
+    if h == 1:
+        hs.pop(ticker, None)                       # 1 is the default: nothing to remember
+    else:
+        hs[ticker] = h
+    HORIZONS.write_text(json.dumps(dict(sorted(hs.items())), indent=2) + "\n")
 
 
 def open_file(path: Path) -> None:
@@ -330,10 +358,11 @@ def last_check_line(log: pd.DataFrame, ticker: str) -> str | None:
             f"({x.actual_close / x.close_p50 - 1:+.1%}, {hit} its 80% range)")
 
 
-def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None = None) -> None:
+def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None = None,
+            horizon: int = 1) -> None:
     t_start = time.time()
     name = ticker.lstrip("^")
-    cfg = wf.Config(ticker=ticker, horizon=a.horizon, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
+    cfg = wf.Config(ticker=ticker, horizon=horizon, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
                     smooth=a.smooth, data_dir=wf.Config.data_dir)
     now = datetime.now(ts.JKT)
 
@@ -628,8 +657,9 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=20, help="LSTM forecast horizon in trading days")
     ap.add_argument("--seeds", type=int, default=5, help="LSTM ensemble size (fewer = faster)")
     ap.add_argument("--history", type=int, default=10, help="recent sessions to show")
-    ap.add_argument("--horizon", type=int, default=1,
-                    help="signal looks this many sessions ahead (1 = next day; e.g. 10 to hold for weeks)")
+    ap.add_argument("--horizon", type=int, default=None,
+                    help="signal looks this many sessions ahead, for this run only "
+                         "(default: the one saved per stock, else 1)")
     ap.add_argument("--take-profit", type=float, default=2.0,
                     help="take-profit at the buy price + this x GARCH volatility over the horizon (0 = off)")
     ap.add_argument("--stop-loss", type=float, default=0.0,
@@ -642,8 +672,8 @@ def main() -> None:
     ap.add_argument("--refresh", action="store_true", help="retrain instead of using the models cached at the last close")
     a = ap.parse_args()
 
-    print(f"{LINE}\n  IDX stock analyser - type a code (e.g. MTLA), Enter to run. "
-          f"Esc = menu, Ctrl-C = cancel.\n{LINE}")
+    print(f"{LINE}\n  IDX stock analyser - type a code (e.g. MTLA), Enter to run; 'MTLA 10' saves a\n"
+          f"  10-day horizon for MTLA. Esc = menu, Ctrl-C = cancel.\n{LINE}")
     queue = list(a.codes)
     try:
         while True:
@@ -652,11 +682,26 @@ def main() -> None:
                 if menu() == "2":
                     break
                 continue
-            ticker = normalize(raw)
+            parts = raw.split()
+            ticker = normalize(parts[0]) if parts else None
+            new_h = None
+            if len(parts) == 2 and parts[1].isdigit() and 1 <= int(parts[1]) <= 60:
+                new_h = int(parts[1])
+            elif len(parts) > 1:
+                ticker = None
             if ticker is None:
                 if raw.strip():
-                    print(f"  '{raw.strip()}' doesn't look like a stock code.")
+                    print(f"  '{raw.strip()}' doesn't look like a stock code (or 'CODE days', e.g. MTLA 10).")
                 continue
+            if new_h is not None:
+                save_horizon(ticker, new_h)
+                print(f"  Saved: {ticker} uses a {new_h}-day horizon from now on.")
+            h = horizon_for(ticker, a.horizon)
+            src = ("--horizon, this run only" if a.horizon is not None else
+                   "saved" if ticker in saved_horizons() else "default")
+            print(f"  Horizon: {h} day{'s' if h > 1 else ''} ({src}"
+                  + (f"; type '{ticker.removesuffix('.JK')} {1 if h > 1 else 10}' to change" if a.horizon is None else "")
+                  + ")")
             ans = read_input(f"  Do you own {ticker} now? [y/N] (Esc = cancel): ", single=True)
             if ans is None:
                 continue
@@ -667,7 +712,7 @@ def main() -> None:
                     continue
                 cost = parse_price(c)
             try:
-                analyze(ticker, a, owned=owned, cost=cost)
+                analyze(ticker, a, owned=owned, cost=cost, horizon=h)
             except KeyboardInterrupt:
                 print("\n  Cancelled.")
             except (Exception, SystemExit) as e:

@@ -20,6 +20,8 @@ otherwise refits them (~5-8 min) and refreshes the cache for stock_cli too.
     python backtest_all.py MTLA.JK
     python backtest_all.py BBCA --offline
     python backtest_all.py MTLA --horizon 10      # stock_cli's --horizon 10 rule in 2 and 2c
+
+Without --horizon it uses the horizon stock_cli has saved for the stock (else 1).
 """
 
 from __future__ import annotations
@@ -211,10 +213,14 @@ def main() -> None:
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--no-lstm", action="store_true", help="skip the LSTM veto rows in 2c")
-    ap.add_argument("--horizon", type=int, default=1, help="signal horizon, as stock_cli --horizon")
+    ap.add_argument("--horizon", type=int, default=None,
+                    help="signal horizon (default: the one stock_cli saved for this stock, else 1)")
     a = ap.parse_args()
     ticker = sc.normalize(a.code) or a.code
-    cfg = wf.Config(ticker=ticker, horizon=a.horizon, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
+    h = sc.horizon_for(ticker, a.horizon)
+    print(f"Horizon {h} day(s)" + (" (from --horizon)" if a.horizon is not None else
+                                   " (saved by stock_cli)" if ticker in sc.saved_horizons() else " (default)"))
+    cfg = wf.Config(ticker=ticker, horizon=h, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
                     smooth=a.smooth, data_dir=wf.Config.data_dir)
     now = datetime.now(ts.JKT)
 
