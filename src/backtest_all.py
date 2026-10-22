@@ -19,6 +19,7 @@ otherwise refits them (~5-8 min) and refreshes the cache for stock_cli too.
 
     python backtest_all.py MTLA.JK
     python backtest_all.py BBCA --offline
+    python backtest_all.py MTLA --horizon 10      # stock_cli's --horizon 10 rule in 2 and 2c
 """
 
 from __future__ import annotations
@@ -128,9 +129,10 @@ def trade_stats(bt: pd.DataFrame, close: pd.Series, cfg: wf.Config) -> dict:
 def replay_exits(px: pd.DataFrame, dates: pd.DatetimeIndex, p_s: pd.Series, move: pd.Series,
                  sd: pd.Series, cfg: wf.Config, k_tp: float, k_sl: float,
                  veto: pd.Series | None = None) -> dict:
-    """'Both agree' with stock_cli's exits: bought at the close, a sell limit k_tp x the
-    daily vol above the buy price and a stop k_sl x below (0 = off), checked on each later
-    session's high / low (stop first when both trade; a gap through fills at the open).
+    """'Both agree' with stock_cli's exits: bought at the close, a sell limit k_tp x `sd`
+    (the volatility over the horizon) above the buy price and a stop k_sl x below (0 = off),
+    checked on each later session's high / low (stop first when both trade; a gap through
+    fills at the open). `move` None = the signal alone decides (stock_cli's --horizon > 1).
     `veto`: no BUY when the LSTM 20-day median move is below zero."""
     entry, ex, hurdle = cfg.prob_threshold, min(cfg.exit_threshold, cfg.prob_threshold), cfg.buy_cost + cfg.sell_cost
     owned, ref, paid, tp, sl = False, 0.0, 0.0, np.inf, 0.0
@@ -147,7 +149,8 @@ def replay_exits(px: pd.DataFrame, dates: pd.DatetimeIndex, p_s: pd.Series, move
                 g, owned = out / ref * (1 - cfg.sell_cost), False
                 trips.append(out / paid * (1 - cfg.sell_cost) / (1 + cfg.buy_cost) - 1)
         s = ("SELL" if p_s[d] < ex else "HOLD") if owned else ("BUY" if p_s[d] > entry else "WAIT")
-        f = ("SELL" if move[d] < -cfg.sell_cost else "HOLD") if owned else ("BUY" if move[d] > hurdle else "WAIT")
+        f = s if move is None else (("SELL" if move[d] < -cfg.sell_cost else "HOLD") if owned
+                                    else ("BUY" if move[d] > hurdle else "WAIT"))
         call = s if s == f else None
         if call == "BUY" and veto is not None and veto.get(d, 0.0) < 0:
             call = None
@@ -208,9 +211,10 @@ def main() -> None:
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--no-lstm", action="store_true", help="skip the LSTM veto rows in 2c")
+    ap.add_argument("--horizon", type=int, default=1, help="signal horizon, as stock_cli --horizon")
     a = ap.parse_args()
     ticker = sc.normalize(a.code) or a.code
-    cfg = wf.Config(ticker=ticker, horizon=1, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
+    cfg = wf.Config(ticker=ticker, horizon=a.horizon, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
                     smooth=a.smooth, data_dir=wf.Config.data_dir)
     now = datetime.now(ts.JKT)
 
@@ -218,7 +222,7 @@ def main() -> None:
     px = ts.load(ticker, cfg, a.offline)
     mkt = ts.load(cfg.market, cfg, a.offline)
     px_f, mkt_f, day_f = nd.finished(px, mkt)
-    sig, _ = mc.cached("signal", ticker, day_f, {"retrain": cfg.retrain, "min_train": cfg.min_train},
+    sig, _ = mc.cached(sc.sig_kind(cfg), ticker, day_f, {"retrain": cfg.retrain, "min_train": cfg.min_train},
                        lambda: sc.signal_fit(px_f, mkt_f, cfg), a.refresh)
     st = cached_with_oos("next_day", ticker, day_f, {"n_seeds": 3},
                          lambda: nd.fit(px_f, mkt_f, ticker, n_seeds=3), a.refresh)
@@ -268,7 +272,7 @@ def main() -> None:
     print(sc.fmt_table(tbl))
     print(f"\n  Direction hit (days where both moved): signal P(up)>0.5 "
           f"{((p.reindex(dates) > 0.5) == (fwd_up == 1)).mean():.0%} | LightGBM forecast {hit_fc:.0%}")
-    print(f"  stock_cli's decision = 'Both agree ({m_live})' row. Starts out of the stock on {dates[0]:%Y-%m-%d}.")
+    print(f"  stock_cli's decision = '{'Both agree (' + m_live + ')' if cfg.horizon == 1 else 'Signal only'}' row. Starts out of the stock on {dates[0]:%Y-%m-%d}.")
 
     m_open = sc.best_model(st["ev"], "open")
     nd.section(f"2b. Limit prices for the next session ({m_open} open range), same {len(dates)} sessions")
@@ -279,9 +283,11 @@ def main() -> None:
     print("  better than open / close = average price advantage on those days vs trading at that open / close.")
     print("  stock_cli uses 'buy at open P10' as its BUY price and 'sell at open P50' as its SELL price.")
 
-    nd.section(f"2c. Exits on the 'Both agree ({m_live})' decision: take-profit / stop-loss, LSTM veto")
-    sd = (sig["vol_fc"] / np.sqrt(wf.TRADING_DAYS)).reindex(dates).ffill()
-    move = pd.Series(np.exp(o["preds"][m_live][o["test"], ci, 1] / 100) - 1, index=dates)
+    H = cfg.horizon
+    rule = f"'Both agree ({m_live})'" if H == 1 else f"{H}-day signal-only"
+    nd.section(f"2c. Exits on the {rule} decision: take-profit / stop-loss, LSTM veto")
+    sd = (sig["vol_fc_h" if H > 1 else "vol_fc"] / np.sqrt(wf.TRADING_DAYS) * np.sqrt(H)).reindex(dates).ffill()
+    move = pd.Series(np.exp(o["preds"][m_live][o["test"], ci, 1] / 100) - 1, index=dates) if H == 1 else None
     veto = None
     if not a.no_lstm:
         print("  LSTM 20-day range (cached by stock_cli, else ~2 min) ...", flush=True)
@@ -299,7 +305,7 @@ def main() -> None:
             rows[name + " + LSTM veto"] = replay_exits(px_f, dates, p_s, move, sd, cfg, k_tp, k_sl, veto)
     print(sc.fmt_table(pd.DataFrame(rows).T[["CAGR", "Sharpe", "MaxDD", "round trips", "won", "avg trip",
                                             "take-profits", "stops"]]))
-    print("  TP / stop = k x the GARCH daily volatility from the buy price. Bought at the close, exits on")
+    print(f"  TP / stop = k x the GARCH volatility over {H} day(s) from the buy price. Bought at the close, exits on")
     print("  later highs / lows. stock_cli defaults: TP 2x, no stop, no LSTM veto. Few trips = weak evidence.")
 
     # ================= 3. intraday =================

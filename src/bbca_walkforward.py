@@ -212,9 +212,12 @@ def walk_forward_predict(df: pd.DataFrame, feature_cols: list[str], cfg: Config)
     return out, imp
 
 
-def garch_vol_forecast(returns: pd.Series, cfg: Config) -> pd.Series:
+def garch_vol_forecast(returns: pd.Series, cfg: Config, horizon: int = 1) -> pd.Series:
     """Walk-forward 1-day-ahead GARCH(1,1) vol forecast (annualised), refit every
-    `retrain` days on all data up to t. Forecast made at t applies to t+1."""
+    `retrain` days on all data up to t. Forecast made at t applies to t+1. With
+    horizon > 1: the average over days t+1..t+horizon, so a volatility spike is
+    expected to fade the way GARCH says it will (x sqrt(horizon / 252) = the
+    horizon's vol)."""
     from arch import arch_model
 
     r = returns.dropna() * 100                     # arch prefers % returns
@@ -227,8 +230,8 @@ def garch_vol_forecast(returns: pd.Series, cfg: Config) -> pd.Series:
         params = res.params
         # Filter forward through the test window with fixed params (no refit leak)
         full = arch_model(r.iloc[:end], vol="GARCH", p=1, q=1, dist="t", mean="Constant")
-        f = full.fix(params).forecast(horizon=1, start=r.index[start - 1], reindex=True)
-        fc.iloc[start - 1:end] = np.sqrt(f.variance.iloc[start - 1:end, 0].values)
+        f = full.fix(params).forecast(horizon=horizon, start=r.index[start - 1], reindex=True)
+        fc.iloc[start - 1:end] = np.sqrt(f.variance.iloc[start - 1:end, :horizon].mean(axis=1).values)
     return fc / 100 * np.sqrt(TRADING_DAYS)
 
 

@@ -35,6 +35,13 @@ the answer is SELL. --stop-loss adds a stop the same way (off by default: in
 the replay it helped some stocks and hurt others; the exit signal already
 acts as a stop).
 
+--horizon N makes the signal look N sessions ahead instead of one: the
+classifier is retrained to predict the N-day move, the decision follows it
+alone (the next-session forecast is shown but has no vote, it only looks one
+day out), and the take-profit widens to 2x the N-day volatility. In the
+2016-2026 replay 10 days beat 1 day on MTLA but lost to it on BBCA and BBRI,
+so pick it per stock: python backtest_all.py MTLA --horizon 10.
+
 The LSTM 20-day median is shown next to the two calls but has no vote unless
 you pass --lstm-veto: it has no edge over a random walk, and in the replay
 vetoing BUYs on it cut returns.
@@ -49,6 +56,7 @@ Ctrl-C cancels a running analysis.
     python stock_cli.py
     python stock_cli.py MTLA BBCA                  # analyse these first, then prompt
     python stock_cli.py --no-lstm --no-open        # faster, don't open the chart
+    python stock_cli.py MTLA --horizon 10          # hold for weeks, not days
 
 sweep.py, holdout.py and intraday_test.py are research tools and are not run
 here. Every decision is appended to output/signals_log.csv, every forecast to
@@ -138,6 +146,24 @@ def read_input(prompt: str, single: bool = False) -> str | None:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def parse_price(s: str) -> float | None:
+    """'5,075' / '5.075' -> 5075 (thousands), '378.7' / '378,7' -> 378.7 (decimal).
+    A separator followed by exactly three digits is a thousands separator."""
+    s = s.strip().replace(" ", "")
+    if "," in s and "." in s:                       # the later one is the decimal point
+        dec = "," if s.rfind(",") > s.rfind(".") else "."
+        s = s.replace("." if dec == "," else ",", "").replace(",", ".")
+    elif re.fullmatch(r"\d{1,3}([.,]\d{3})+", s):
+        s = re.sub(r"[.,]", "", s)
+    else:
+        s = s.replace(",", ".")
+    try:
+        v = float(s)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
 def menu() -> str:
     print("\n  1. Enter another company\n  2. Exit")
     while True:
@@ -194,18 +220,25 @@ def to_tick(p: float, up: bool) -> float:
 # ----------------------------------------------------------------------------
 # Analysis
 # ----------------------------------------------------------------------------
+def sig_kind(cfg: wf.Config) -> str:
+    """Cache name of the signal models: one per horizon, so a 10-day run doesn't evict the
+    1-day models (model_cache keeps one file per name)."""
+    return "signal" if cfg.horizon == 1 else f"signal_h{cfg.horizon}"
+
+
 def next_day_call(owned: bool, p_s: float, cfg: wf.Config) -> tuple[str, str]:
     """BUY / HOLD / SELL / WAIT for your actual position, with the backtest's entry/exit rule:
     buy when smoothed P(up) > entry, then hold until it drops below exit."""
     entry = cfg.prob_threshold
     ex = entry if cfg.exit_threshold is None else min(cfg.exit_threshold, entry)
+    pu = "smoothed P(up)" if cfg.horizon == 1 else f"smoothed P(up over {cfg.horizon} days)"
     if owned:
         if p_s < ex:
-            return "SELL", f"smoothed P(up) {p_s:.3f} is below the exit level {ex}"
-        return "HOLD", f"smoothed P(up) {p_s:.3f} is still above the exit level {ex} (margin {p_s - ex:.3f})"
+            return "SELL", f"{pu} {p_s:.3f} is below the exit level {ex}"
+        return "HOLD", f"{pu} {p_s:.3f} is still above the exit level {ex} (margin {p_s - ex:.3f})"
     if p_s > entry:
-        return "BUY", f"smoothed P(up) {p_s:.3f} is above the entry level {entry}"
-    return "WAIT - don't buy", f"smoothed P(up) {p_s:.3f} is below the entry level {entry} (needs +{entry - p_s:.3f})"
+        return "BUY", f"{pu} {p_s:.3f} is above the entry level {entry}"
+    return "WAIT - don't buy", f"{pu} {p_s:.3f} is below the entry level {entry} (needs +{entry - p_s:.3f})"
 
 
 def exit_levels(base: float, sd: float, a: argparse.Namespace) -> tuple[float | None, float | None]:
@@ -265,7 +298,8 @@ def signal_fit(px: pd.DataFrame, mkt: pd.DataFrame, cfg: wf.Config) -> dict:
     train = train[train["target"].notna()]
     models = {c: m.fit(train[cols], train["target"].astype(int)) for c, m in wf.make_models(cfg).items()}
     return {"cols": cols, "probs": probs, "importance": importance, "models": models,
-            "vol_fc": wf.garch_vol_forecast(df["ret"], cfg)}
+            "vol_fc": wf.garch_vol_forecast(df["ret"], cfg),
+            "vol_fc_h": wf.garch_vol_forecast(df["ret"], cfg, cfg.horizon) if cfg.horizon > 1 else None}
 
 
 def signal_probs(sig: dict, df: pd.DataFrame) -> pd.DataFrame:
@@ -299,7 +333,7 @@ def last_check_line(log: pd.DataFrame, ticker: str) -> str | None:
 def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None = None) -> None:
     t_start = time.time()
     name = ticker.lstrip("^")
-    cfg = wf.Config(ticker=ticker, horizon=1, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
+    cfg = wf.Config(ticker=ticker, horizon=a.horizon, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
                     smooth=a.smooth, data_dir=wf.Config.data_dir)
     now = datetime.now(ts.JKT)
 
@@ -316,8 +350,9 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     px_f, mkt_f, day_f = nd.finished(px, mkt)
 
     # ---- walk-forward backtest (shared by the table and the signal)
-    print("[2/5] Signal: walk-forward models + GARCH (~1 min, once per close) ...", flush=True)
-    sig, hit = mc.cached("signal", ticker, day_f, {"retrain": cfg.retrain, "min_train": cfg.min_train},
+    print(f"[2/5] Signal ({cfg.horizon}-day): walk-forward models + GARCH "
+          f"(~{1 if cfg.horizon == 1 else 3} min, once per close) ...", flush=True)
+    sig, hit = mc.cached(sig_kind(cfg), ticker, day_f, {"retrain": cfg.retrain, "min_train": cfg.min_train},
                          lambda: signal_fit(px_f, mkt_f, cfg), a.refresh)
     if hit:
         print(f"  using the models fitted after the {day_f:%Y-%m-%d} close (cached)")
@@ -385,7 +420,8 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
 
     # ================= output =================
     section(f"{ticker} walk-forward backtest, {oos[0]:%Y-%m-%d} -> {oos[-1]:%Y-%m-%d} (after costs)")
-    print(f"Entry > {cfg.prob_threshold}, exit < {cfg.exit_threshold}, P(up) smoothed {cfg.smooth}d | "
+    print(f"P(up over {cfg.horizon}d) entry > {cfg.prob_threshold}, exit < {cfg.exit_threshold}, "
+          f"smoothed {cfg.smooth}d | "
           f"costs buy {cfg.buy_cost:.2%} / sell {cfg.sell_cost:.2%}\n")
     print(fmt_table(tbl))
 
@@ -423,6 +459,8 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     s_call, s_why = next_day_call(owned, float(p_s.iloc[-1]), cfg)
     f_call, f_why, f_model, f_move = forecast_call(owned, fc, cfg)
     call, why = combine(owned, s_call, f_call)
+    if cfg.horizon > 1:                             # the replayed multi-day rule is the signal alone
+        call, why = s_call, f"the {cfg.horizon}-day signal decides; the next-session forecast has no vote"
     size = 1.0
     if a.model == "LightGBM+GARCH" and pd.notna(vol_fc.iloc[-1]):
         size = min(cfg.vol_target / vol_fc.iloc[-1], cfg.max_leverage)
@@ -432,7 +470,7 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     print(LINE)
     print(f"  You {'own' if owned else 'do not own'} it. Decision for {when}:\n")
     print(f"  {'Signal call':<15}{s_call:<18}{s_why}")
-    print(f"  {'Forecast call':<15}{f_call:<18}{f_why}")
+    print(f"  {'Forecast call' if cfg.horizon == 1 else 'Fcst (no vote)':<15}{f_call:<18}{f_why}")
     # one price per action. Today: the expected close, as a limit in the closing auction.
     # Tomorrow: the limits that held up in backtest_all.py - buy at the low end of the
     # open range, sell at its median - each placed for the whole session
@@ -462,7 +500,12 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     buy_at = nd.to_tick(t[1], "near") if t is not None else (last if provisional else tom["BUY"])
     base = (cost or last) if owned else buy_at
     base_txt = ("your buy price" if cost else "today's price") if owned else "the buy price"
-    tp, sl = exit_levels(base, sd, a)
+    sd_h = sd                                       # volatility over the holding view
+    if cfg.horizon > 1:
+        v = sig["vol_fc_h"].reindex(oos).ffill().iloc[-1]
+        sd_h = (float(v) / np.sqrt(wf.TRADING_DAYS) if pd.notna(v) else sd) * np.sqrt(cfg.horizon)
+    vol_txt = "daily vol" if cfg.horizon == 1 else f"{cfg.horizon}-day vol"
+    tp, sl = exit_levels(base, sd_h, a)
     if owned and call != "SELL":
         if tp is not None and last >= tp:
             call, why = "SELL", f"price {last:,.0f} is at or above the take-profit {tp:,.0f}"
@@ -486,14 +529,16 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     exits = []
     if tp is not None:
         exits.append(f"Take profit: SELL limit at {tp:,.0f}  ({tp / base - 1:+.1%} from {base_txt} {base:,.0f}, "
-                     f"{a.take_profit:g} x daily vol {sd:.1%})")
+                     f"{a.take_profit:g} x {vol_txt} {sd_h:.1%})")
     if sl is not None:
-        exits.append(f"Stop loss  : SELL if it trades at {sl:,.0f}  ({sl / base - 1:+.1%}, {a.stop_loss:g} x daily vol)")
+        exits.append(f"Stop loss  : SELL if it trades at {sl:,.0f}  ({sl / base - 1:+.1%}, {a.stop_loss:g} x {vol_txt})")
 
     if call in order:
         print(f"\n  >>> {order[call]}"
               + (f"  ({size:.0%} of the money you'd put in this stock)" if call == "BUY" else ""))
         print(f"      ({why})")
+        if call == "SELL" and cost:
+            print(f"      Your buy price {cost:,.0f}: {last / cost - 1:+.1%} at today's price, before costs")
         if call == "BUY":
             for x in exits:
                 print(f"      {x}")
@@ -516,6 +561,11 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     lbl = "Tomorrow (prov.)" if provisional else f"{nxt:%a %d %b}"
     print(f"  {lbl + ' open 80%':<26}: {band(o_q)} ({m_open})")
     print(f"  {lbl + ' close 80%':<26}: {band(c_q)} ({m_close})")
+    if cfg.horizon > 1:
+        z = 1.2816                                  # P10 / P90 of a normal
+        print(f"  {f'Next {cfg.horizon} sessions 80%':<26}: {to_tick(last * np.exp(-z * sd_h), up=False):,.0f} - "
+              f"{to_tick(last * np.exp(z * sd_h), up=True):,.0f}  (volatility only: where it can reach "
+              f"either way, not a forecast)")
 
     model_owns = cur_pos > 0
     print(f"\n  Model's own paper position: {act} (P(up) today {p.iloc[-1]:.3f})"
@@ -578,10 +628,12 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=20, help="LSTM forecast horizon in trading days")
     ap.add_argument("--seeds", type=int, default=5, help="LSTM ensemble size (fewer = faster)")
     ap.add_argument("--history", type=int, default=10, help="recent sessions to show")
+    ap.add_argument("--horizon", type=int, default=1,
+                    help="signal looks this many sessions ahead (1 = next day; e.g. 10 to hold for weeks)")
     ap.add_argument("--take-profit", type=float, default=2.0,
-                    help="take-profit at the buy price + this x daily GARCH volatility (0 = off)")
+                    help="take-profit at the buy price + this x GARCH volatility over the horizon (0 = off)")
     ap.add_argument("--stop-loss", type=float, default=0.0,
-                    help="stop-loss at the buy price - this x daily GARCH volatility (0 = off)")
+                    help="stop-loss at the buy price - this x GARCH volatility over the horizon (0 = off)")
     ap.add_argument("--lstm-veto", action="store_true",
                     help="don't BUY when the LSTM 20-day median is below the buy price")
     ap.add_argument("--no-lstm", action="store_true", help="skip the LSTM forecast (~2 min faster)")
@@ -613,8 +665,7 @@ def main() -> None:
                 c = read_input("  Your average buy price? (Enter = skip, Esc = cancel): ")
                 if c is None:
                     continue
-                c = c.strip().replace(",", "").replace(".", "")    # 5,075 / 5.075 -> 5075
-                cost = float(c) if c.isdigit() and int(c) > 0 else None
+                cost = parse_price(c)
             try:
                 analyze(ticker, a, owned=owned, cost=cost)
             except KeyboardInterrupt:
