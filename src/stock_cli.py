@@ -27,6 +27,18 @@ trades when they agree:
   forecast call  next close P50 of the best next-session model vs trading costs:
                  BUY above the round trip (0.40%), SELL below -0.25%
 
+Every BUY and HOLD comes with a take-profit: a sell limit at the buy price
++ 2x the GARCH daily volatility (--take-profit; backtest_all.py section 2c
+replays the multiples). If you own it you can give your average buy price, so
+the target is measured from what you paid; once the price is at or above it
+the answer is SELL. --stop-loss adds a stop the same way (off by default: in
+the replay it helped some stocks and hurt others; the exit signal already
+acts as a stop).
+
+The LSTM 20-day median is shown next to the two calls but has no vote unless
+you pass --lstm-veto: it has no edge over a random walk, and in the replay
+vetoing BUYs on it cut returns.
+
 Heavy models train only on finished sessions and are cached once per close
 (output/cache/), so the first run after a close takes a few minutes and later
 runs that day take seconds. --refresh retrains.
@@ -196,6 +208,14 @@ def next_day_call(owned: bool, p_s: float, cfg: wf.Config) -> tuple[str, str]:
     return "WAIT - don't buy", f"smoothed P(up) {p_s:.3f} is below the entry level {entry} (needs +{entry - p_s:.3f})"
 
 
+def exit_levels(base: float, sd: float, a: argparse.Namespace) -> tuple[float | None, float | None]:
+    """Take-profit / stop-loss prices for a position bought at `base`: k x the daily
+    volatility away, rounded to the tick (k = 0 turns a level off)."""
+    tp = to_tick(base * np.exp(a.take_profit * sd), up=True) if a.take_profit > 0 else None
+    sl = to_tick(base * np.exp(-a.stop_loss * sd), up=False) if a.stop_loss > 0 else None
+    return tp, sl
+
+
 def best_model(ev: pd.DataFrame, price: str) -> str:
     """Next-session model with the best test skill for 'open' or 'close'; Baseline if none beats it."""
     s = ev.xs(price, level="price")["skill"].drop("Baseline")
@@ -276,7 +296,7 @@ def last_check_line(log: pd.DataFrame, ticker: str) -> str | None:
             f"({x.actual_close / x.close_p50 - 1:+.1%}, {hit} its 80% range)")
 
 
-def analyze(ticker: str, a: argparse.Namespace, owned: bool) -> None:
+def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None = None) -> None:
     t_start = time.time()
     name = ticker.lstrip("^")
     cfg = wf.Config(ticker=ticker, horizon=1, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
@@ -436,14 +456,57 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool) -> None:
     else:
         order = {k: f"{k}  - price after the 16:15 run" for k in ("BUY", "SELL")}
 
+    # ---- exits, measured from your buy price (or today's price), or from the BUY order's price
+    sd = float(vol_fc.iloc[-1]) / np.sqrt(wf.TRADING_DAYS) if pd.notna(vol_fc.iloc[-1]) \
+        else float(df["ret"].iloc[-63:].std())
+    buy_at = nd.to_tick(t[1], "near") if t is not None else (last if provisional else tom["BUY"])
+    base = (cost or last) if owned else buy_at
+    base_txt = ("your buy price" if cost else "today's price") if owned else "the buy price"
+    tp, sl = exit_levels(base, sd, a)
+    if owned and call != "SELL":
+        if tp is not None and last >= tp:
+            call, why = "SELL", f"price {last:,.0f} is at or above the take-profit {tp:,.0f}"
+            order["SELL"] = f"SELL at {tp:,.0f} or better  - take-profit limit, fills at once while the price is above it"
+        elif sl is not None and last <= sl:
+            call, why = "SELL", f"price {last:,.0f} is at or below the stop-loss {sl:,.0f}"
+
+    # ---- LSTM 20-day median: shown next to the calls, blocks a BUY only with --lstm-veto
+    lstm_move = None
+    if r is not None:
+        med = float(r["fc"].iloc[-1].lstm_p50)
+        lstm_move = med / last - 1
+        ref = last if owned else base
+        if a.lstm_veto and call == "BUY" and med < ref:
+            call, why = "WAIT - don't buy", f"LSTM {a.days}-day median {med:,.0f} is below the buy price {ref:,.0f}"
+        bull = call == "BUY" or (owned and call == "HOLD")
+        print(f"  {'LSTM veto' if a.lstm_veto else 'LSTM (no vote)':<15}"
+              f"{'agrees' if (med >= ref) == bull else 'DISAGREES':<18}"
+              f"{a.days}-day median {med:,.0f} ({lstm_move:+.1%}) vs {'price now' if owned else 'buy price'} {ref:,.0f}")
+
+    exits = []
+    if tp is not None:
+        exits.append(f"Take profit: SELL limit at {tp:,.0f}  ({tp / base - 1:+.1%} from {base_txt} {base:,.0f}, "
+                     f"{a.take_profit:g} x daily vol {sd:.1%})")
+    if sl is not None:
+        exits.append(f"Stop loss  : SELL if it trades at {sl:,.0f}  ({sl / base - 1:+.1%}, {a.stop_loss:g} x daily vol)")
+
     if call in order:
         print(f"\n  >>> {order[call]}"
               + (f"  ({size:.0%} of the money you'd put in this stock)" if call == "BUY" else ""))
         print(f"      ({why})")
+        if call == "BUY":
+            for x in exits:
+                print(f"      {x}")
+            print("      " + ("Place the take-profit as soon as the buy fills and leave it in; otherwise h"
+                             if tp is not None else "H") + "old until this says SELL.")
     else:
         turn = "SELL" if owned else "BUY"
         print(f"\n  >>> {call}  ({why})")
-        print(f"      If it turns {turn}: {order[turn]}")
+        if owned:
+            for x in exits:
+                print(f"      {x}")
+        print(f"      If it turns {turn}: {order[turn]}"
+              + ("" if owned or tp is None else f", then take profit at {tp:,.0f} ({tp / base - 1:+.1%})"))
         if s_call != f_call:
             print("      Re-run later: the decision trades once both calls point the same way.")
 
@@ -453,7 +516,6 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool) -> None:
     lbl = "Tomorrow (prov.)" if provisional else f"{nxt:%a %d %b}"
     print(f"  {lbl + ' open 80%':<26}: {band(o_q)} ({m_open})")
     print(f"  {lbl + ' close 80%':<26}: {band(c_q)} ({m_close})")
-    print(f"  {lbl + ' prices':<26}: {tom_txt['BUY']} | {tom_txt['SELL']}")
 
     model_owns = cur_pos > 0
     print(f"\n  Model's own paper position: {act} (P(up) today {p.iloc[-1]:.3f})"
@@ -464,7 +526,7 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool) -> None:
         e = r["fc"].iloc[-1]
         print(f"  {f'{a.days}-day 80% range':<26}: {e.lstm_p10:,.0f} - {e.lstm_p90:,.0f}, "
               f"median {e.lstm_p50:,.0f} ({e.lstm_p50 / last - 1:+.1%})"
-              + ("  (volatility range, no edge)" if (r["skill"] <= 0.02).all() else ""))
+              + ("  (volatility range, no edge: it has no vote)" if (r["skill"] <= 0.02).all() else ""))
     chk = last_check_line(flog, ticker)
     if chk:
         print(f"  {'Last forecast check':<26}: {chk}")
@@ -488,6 +550,8 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool) -> None:
         "p_smoothed": round(float(p_s.iloc[-1]), 4), "position": round(float(cur_pos), 4),
         "action": act, "owned": owned, "advice": call, "signal_advice": s_call,
         "forecast_advice": f_call, "forecast_model": f_model, "forecast_move": round(f_move, 4),
+        "lstm_20d_move": None if lstm_move is None else round(lstm_move, 4),
+        "buy_price": cost, "take_profit": tp, "stop_loss": sl,
         "provisional": provisional,
         "price_at": "" if live_at is None else f"{live_at:%Y-%m-%d %H:%M}",
         "run_at": now.strftime("%Y-%m-%d %H:%M WIB"),
@@ -514,6 +578,12 @@ def main() -> None:
     ap.add_argument("--days", type=int, default=20, help="LSTM forecast horizon in trading days")
     ap.add_argument("--seeds", type=int, default=5, help="LSTM ensemble size (fewer = faster)")
     ap.add_argument("--history", type=int, default=10, help="recent sessions to show")
+    ap.add_argument("--take-profit", type=float, default=2.0,
+                    help="take-profit at the buy price + this x daily GARCH volatility (0 = off)")
+    ap.add_argument("--stop-loss", type=float, default=0.0,
+                    help="stop-loss at the buy price - this x daily GARCH volatility (0 = off)")
+    ap.add_argument("--lstm-veto", action="store_true",
+                    help="don't BUY when the LSTM 20-day median is below the buy price")
     ap.add_argument("--no-lstm", action="store_true", help="skip the LSTM forecast (~2 min faster)")
     ap.add_argument("--no-open", action="store_true", help="don't open the forecast chart")
     ap.add_argument("--offline", action="store_true", help="use the CSVs in data/ instead of downloading")
@@ -538,8 +608,15 @@ def main() -> None:
             ans = read_input(f"  Do you own {ticker} now? [y/N] (Esc = cancel): ", single=True)
             if ans is None:
                 continue
+            owned, cost = ans.strip().lower() == "y", None
+            if owned:
+                c = read_input("  Your average buy price? (Enter = skip, Esc = cancel): ")
+                if c is None:
+                    continue
+                c = c.strip().replace(",", "").replace(".", "")    # 5,075 / 5.075 -> 5075
+                cost = float(c) if c.isdigit() and int(c) > 0 else None
             try:
-                analyze(ticker, a, owned=ans.strip().lower() == "y")
+                analyze(ticker, a, owned=owned, cost=cost)
             except KeyboardInterrupt:
                 print("\n  Cancelled.")
             except (Exception, SystemExit) as e:

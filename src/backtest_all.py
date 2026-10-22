@@ -8,7 +8,8 @@ stock_cli.py would have said, and checks it against what happened:
   1. Next-session open / close forecasts (LSTM, LightGBM, Baseline), last 500 sessions:
      accuracy overall, per half-year, and the last 10 sessions one by one
   2. The decision: signal call, forecast call and the combined BUY / SELL / HOLD,
-     run as paper strategies on the same 500 sessions (after costs), vs buy & hold
+     run as paper strategies on the same 500 sessions (after costs), vs buy & hold;
+     then the same decision with take-profit / stop-loss exits and the LSTM veto
   3. Today's-close forecast made from the price at the lunch break (and at every
      other checkpoint), last 120 sessions of hourly data
   4. Today so far: every forecast made for today vs the latest price
@@ -30,6 +31,7 @@ import pandas as pd
 
 import bbca_walkforward as wf
 import intraday_close as ic
+import lstm_forecast as lf
 import model_cache as mc
 import next_day as nd
 import stock_cli as sc
@@ -123,6 +125,55 @@ def trade_stats(bt: pd.DataFrame, close: pd.Series, cfg: wf.Config) -> dict:
             "avg trip": f"{t.mean():+.2%}" if len(t) else "-"}
 
 
+def replay_exits(px: pd.DataFrame, dates: pd.DatetimeIndex, p_s: pd.Series, move: pd.Series,
+                 sd: pd.Series, cfg: wf.Config, k_tp: float, k_sl: float,
+                 veto: pd.Series | None = None) -> dict:
+    """'Both agree' with stock_cli's exits: bought at the close, a sell limit k_tp x the
+    daily vol above the buy price and a stop k_sl x below (0 = off), checked on each later
+    session's high / low (stop first when both trade; a gap through fills at the open).
+    `veto`: no BUY when the LSTM 20-day median move is below zero."""
+    entry, ex, hurdle = cfg.prob_threshold, min(cfg.exit_threshold, cfg.prob_threshold), cfg.buy_cost + cfg.sell_cost
+    owned, ref, paid, tp, sl = False, 0.0, 0.0, np.inf, 0.0
+    rets, trips, n_tp, n_sl = [], [], 0, 0
+    for d in dates:
+        o, h, lo, c = px.loc[d, ["Open", "High", "Low", "Close"]]
+        g = 1.0
+        if owned:
+            out = min(o, sl) if lo <= sl else (max(o, tp) if h >= tp else None)
+            if out is None:
+                g, ref = c / ref, c
+            else:
+                n_sl, n_tp = n_sl + (lo <= sl), n_tp + (lo > sl)
+                g, owned = out / ref * (1 - cfg.sell_cost), False
+                trips.append(out / paid * (1 - cfg.sell_cost) / (1 + cfg.buy_cost) - 1)
+        s = ("SELL" if p_s[d] < ex else "HOLD") if owned else ("BUY" if p_s[d] > entry else "WAIT")
+        f = ("SELL" if move[d] < -cfg.sell_cost else "HOLD") if owned else ("BUY" if move[d] > hurdle else "WAIT")
+        call = s if s == f else None
+        if call == "BUY" and veto is not None and veto.get(d, 0.0) < 0:
+            call = None
+        if owned and call == "SELL":
+            g, owned = g * (1 - cfg.sell_cost), False
+            trips.append(c / paid * (1 - cfg.sell_cost) / (1 + cfg.buy_cost) - 1)
+        elif not owned and call == "BUY":
+            g, owned, ref, paid = g / (1 + cfg.buy_cost), True, c, c
+            tp = c * np.exp(k_tp * sd[d]) if k_tp > 0 else np.inf
+            sl = c * np.exp(-k_sl * sd[d]) if k_sl > 0 else 0.0
+        rets.append(g - 1)
+    r = pd.Series(rets, index=dates)
+    t = np.array(trips)
+    return {**wf.metrics(pd.DataFrame({"ret": r, "equity": (1 + r).cumprod(), "pos": 0.0, "turnover": 0.0})),
+            "round trips": len(t), "won": f"{(t > 0).mean():.0%}" if len(t) else "-",
+            "avg trip": f"{t.mean():+.2%}" if len(t) else "-", "take-profits": n_tp, "stops": n_sl}
+
+
+def lstm_test_moves(r: dict) -> pd.Series:
+    """LSTM 20-day median move on its own test days, indexed by the day it was made."""
+    close = r["close"]
+    i = close.index.get_indexer(r["test_dates"]) - r["H"]
+    m = pd.Series(r["test_band"][:, 1] / close.values[i] - 1, index=close.index[i])
+    return m[~m.index.duplicated()]
+
+
 # ----------------------------------------------------------------------------
 # 3. Intraday forecast by checkpoint
 # ----------------------------------------------------------------------------
@@ -156,6 +207,7 @@ def main() -> None:
     ap.add_argument("--smooth", type=int, default=3)
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--refresh", action="store_true")
+    ap.add_argument("--no-lstm", action="store_true", help="skip the LSTM veto rows in 2c")
     a = ap.parse_args()
     ticker = sc.normalize(a.code) or a.code
     cfg = wf.Config(ticker=ticker, horizon=1, prob_threshold=a.threshold, exit_threshold=a.exit_threshold,
@@ -226,6 +278,29 @@ def main() -> None:
     print("  Order placed after the close for the whole next session. fills = share of sessions it filled;")
     print("  better than open / close = average price advantage on those days vs trading at that open / close.")
     print("  stock_cli uses 'buy at open P10' as its BUY price and 'sell at open P50' as its SELL price.")
+
+    nd.section(f"2c. Exits on the 'Both agree ({m_live})' decision: take-profit / stop-loss, LSTM veto")
+    sd = (sig["vol_fc"] / np.sqrt(wf.TRADING_DAYS)).reindex(dates).ffill()
+    move = pd.Series(np.exp(o["preds"][m_live][o["test"], ci, 1] / 100) - 1, index=dates)
+    veto = None
+    if not a.no_lstm:
+        print("  LSTM 20-day range (cached by stock_cli, else ~2 min) ...", flush=True)
+        r, _ = mc.cached("lstm_range", ticker, day_f, {"days": 20, "seeds": 5},
+                         lambda: lf.run(px_f, mkt_f, ticker, 20, 60, 5), a.refresh)
+        veto = lstm_test_moves(r)
+        on = dates[dates >= veto.index[0]]
+        print(f"  LSTM test days cover {len(on)} of the {len(dates)} sessions; "
+              f"its median pointed down on {(veto.reindex(on) < 0).mean():.0%} of them.")
+    rows = {}
+    for k_tp, k_sl in ((0, 0), (1.5, 0), (2, 0), (3, 0), (2, 2), (2, 3)):
+        name = f"TP {k_tp:g}x / stop {k_sl:g}x" if k_tp or k_sl else "no exits"
+        rows[name] = replay_exits(px_f, dates, p_s, move, sd, cfg, k_tp, k_sl)
+        if veto is not None and k_sl == 0 and k_tp in (0, 2):
+            rows[name + " + LSTM veto"] = replay_exits(px_f, dates, p_s, move, sd, cfg, k_tp, k_sl, veto)
+    print(sc.fmt_table(pd.DataFrame(rows).T[["CAGR", "Sharpe", "MaxDD", "round trips", "won", "avg trip",
+                                            "take-profits", "stops"]]))
+    print("  TP / stop = k x the GARCH daily volatility from the buy price. Bought at the close, exits on")
+    print("  later highs / lows. stock_cli defaults: TP 2x, no stop, no LSTM veto. Few trips = weak evidence.")
 
     # ================= 3. intraday =================
     live_today = px.attrs.get("provisional") and px.index[-1].date() == now.date()
