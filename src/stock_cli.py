@@ -47,6 +47,17 @@ the prompt to run MTLA on 10 days and save it, "MTLA 1" to go back; plain
 "MTLA" uses the saved value (1 if none). --horizon N overrides it for one run
 without saving. backtest_all.py uses the same saved value.
 
+Every run ends with a price plan, whatever the decision: the buy limit, the
+most worth paying (the next close P50 less the 0.40% round trip, the forecast
+call's own hurdle), and the target price (the take-profit), plus the stop if
+--stop-loss is on. An LSTM check line says where the target sits in the LSTM
+20-day range (a sanity check, no vote). The buy limit and that cap are logged as buy_limit / max_buy.
+
+A data check lists unusual one-day moves of the last 63 sessions (over 8% and
+6x the stock's normal daily move) and marks the ones that look like bad data:
+the close outside the day's range, a move beyond IDX's price limits, no volume,
+or a move reversed the next day. Market-wide moves count as real.
+
 The LSTM 20-day median is shown next to the two calls but has no vote unless
 you pass --lstm-veto: it has no edge over a random walk, and in the replay
 vetoing BUYs on it cut returns.
@@ -358,6 +369,45 @@ def last_check_line(log: pd.DataFrame, ticker: str) -> str | None:
             f"({x.actual_close / x.close_p50 - 1:+.1%}, {hit} its 80% range)")
 
 
+def data_check(px: pd.DataFrame, mkt: pd.DataFrame, days: int = 63) -> list[tuple[pd.Timestamp, bool, str]]:
+    """Unusual daily bars in the last `days` sessions: (date, suspicious, description).
+    A move is unusual when it is over 8% and over 6x the stock's robust daily volatility
+    (median absolute return of the previous year x 1.4826). Suspicious = looks like bad
+    data rather than a real move: the close outside the day's range, a move beyond IDX's
+    daily price limits (35% is the widest), no volume, or reversed the next day. A real
+    crash (16 Oct 2026, IHSG -12%) shows up as market-wide and not suspicious."""
+    r = np.log(px["Close"]).diff()
+    sig = (r.abs().rolling(252, min_periods=60).median() * 1.4826).shift(1)
+    vol_x = px["Volume"] / px["Volume"].rolling(63, min_periods=20).median().shift(1)
+    mr = np.log(mkt["Close"]).diff().reindex(px.index)
+    nxt = r.shift(-1)
+    bad_bar = ((px["Close"] > px["High"] * 1.001) | (px["Close"] < px["Low"] * 0.999)
+               | (px["High"] < px["Low"]) | (px["Close"] <= 0))
+    big = (r.abs() > 0.08) & (r.abs() > 6 * sig)
+    out = []
+    for d in px.index[-days:]:
+        if not (big[d] or bad_bar[d]):
+            continue
+        prev = out[-1] if out and px.index.get_loc(out[-1][0]) == px.index.get_loc(d) - 1 else None
+        move = f"{np.expm1(r[d]):+.1%}" if pd.notna(r[d]) else "n/a"
+        ctx = f"{d:%Y-%m-%d} {move}" + (f", {vol_x[d]:.1f}x usual volume" if pd.notna(vol_x[d]) else "")
+        if prev is not None and prev[1] and big[d] and np.sign(r[d]) == -np.sign(r[prev[0]]):
+            out.append((d, True, f"{ctx}: undoes the suspicious move of {prev[0]:%d %b}"))
+        elif bad_bar[d]:
+            out.append((d, True, f"{ctx}: the close is outside the day's high-low, a bad bar"))
+        elif abs(np.expm1(r[d])) > 0.35:
+            out.append((d, True, f"{ctx}: beyond IDX's daily price limits, an unadjusted corporate action or bad data"))
+        elif px["Volume"][d] == 0:
+            out.append((d, True, f"{ctx}: no volume, likely a bad price"))
+        elif pd.notna(nxt[d]) and np.sign(nxt[d]) == -np.sign(r[d]) and abs(r[d] + nxt[d]) < 0.25 * abs(r[d]):
+            out.append((d, True, f"{ctx}: reversed the next day ({np.expm1(nxt[d]):+.1%}), possibly a bad tick"))
+        elif pd.notna(mr[d]) and np.sign(mr[d]) == np.sign(r[d]) and abs(mr[d]) >= 0.5 * abs(r[d]):
+            out.append((d, False, f"{ctx}: IHSG {np.expm1(mr[d]):+.1%} the same day, market-wide, likely real"))
+        else:
+            out.append((d, False, f"{ctx}: stock-specific (IHSG {np.expm1(mr[d]):+.1%}), check the news"))
+    return out
+
+
 def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None = None,
             horizon: int = 1) -> None:
     t_start = time.time()
@@ -474,6 +524,15 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
     if ir is not None:
         nd.report_intraday(ir, px.index[-2], flog)
 
+    checks = data_check(px, mkt)
+    if checks:
+        section(f"{ticker} data check: unusual daily moves in the last 63 sessions")
+        for _, bad, txt in checks:
+            print(f"  {'SUSPICIOUS ' if bad else ''}{txt}")
+        print("\n  Big moves inflate the volatility behind the target, the stop and the bands for weeks."
+              + ("\n  Compare the SUSPICIOUS days with your broker's chart; if they are wrong, every number here is off."
+                 if any(b for _, b, _ in checks) else ""))
+
     # ---- summary
     price_txt = (f"live {live_at:%H:%M} WIB, PROVISIONAL" if provisional and live_at is not None
                  else "close")
@@ -555,13 +614,6 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
               f"{'agrees' if (med >= ref) == bull else 'DISAGREES':<18}"
               f"{a.days}-day median {med:,.0f} ({lstm_move:+.1%}) vs {'price now' if owned else 'buy price'} {ref:,.0f}")
 
-    exits = []
-    if tp is not None:
-        exits.append(f"Take profit: SELL limit at {tp:,.0f}  ({tp / base - 1:+.1%} from {base_txt} {base:,.0f}, "
-                     f"{a.take_profit:g} x {vol_txt} {sd_h:.1%})")
-    if sl is not None:
-        exits.append(f"Stop loss  : SELL if it trades at {sl:,.0f}  ({sl / base - 1:+.1%}, {a.stop_loss:g} x {vol_txt})")
-
     if call in order:
         print(f"\n  >>> {order[call]}"
               + (f"  ({size:.0%} of the money you'd put in this stock)" if call == "BUY" else ""))
@@ -569,20 +621,46 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
         if call == "SELL" and cost:
             print(f"      Your buy price {cost:,.0f}: {last / cost - 1:+.1%} at today's price, before costs")
         if call == "BUY":
-            for x in exits:
-                print(f"      {x}")
             print("      " + ("Place the take-profit as soon as the buy fills and leave it in; otherwise h"
                              if tp is not None else "H") + "old until this says SELL.")
     else:
         turn = "SELL" if owned else "BUY"
         print(f"\n  >>> {call}  ({why})")
-        if owned:
-            for x in exits:
-                print(f"      {x}")
-        print(f"      If it turns {turn}: {order[turn]}"
-              + ("" if owned or tp is None else f", then take profit at {tp:,.0f} ({tp / base - 1:+.1%})"))
+        print(f"      If it turns {turn}: {order[turn]}")
         if s_call != f_call:
             print("      Re-run later: the decision trades once both calls point the same way.")
+
+    # ---- price plan, shown whatever the decision: where to buy, the most worth paying
+    # (the next close P50 less the round trip, the forecast call's own hurdle), and the target
+    hurdle = cfg.buy_cost + cfg.sell_cost
+    cap = to_tick(c_q[1] / (1 + hurdle), up=False) if m_close != "Baseline" else None
+    if t is not None:
+        buy_txt = f"{buy_at:,.0f}  limit in today's closing auction (today's close P50, {m_now})"
+    elif not provisional:
+        buy_txt = (f"{tom['BUY']:,.0f}  limit for {nxt:%a %d %b} (open P10, {m_open}"
+                   + ("" if lim is None else f", filled {lim.at[fills['BUY'], 'fills']:.0%} of test days") + ")")
+    else:
+        buy_txt = "price after the 16:15 run"
+    print(f"\n  Price plan{' (if it turns BUY)' if not owned and call != 'BUY' else ''}:")
+    print(f"    {'Add more at' if owned else 'Buy at':<16}: {buy_txt}")
+    if cap is not None:
+        print(f"    {'Pay no more than':<16}: {cap:,.0f}  (next close P50 {nd.to_tick(c_q[1], 'near'):,.0f}, {m_close}, "
+              f"less the {hurdle:.2%} round trip" + ("; a 1-day view" if cfg.horizon > 1 else "") + ")"
+              + ("" if (t is None and provisional) or cap >= buy_at else "  - below the buy limit: no edge today"))
+    if tp is not None:
+        print(f"    {'Target price':<16}: {tp:,.0f}  ({tp / base - 1:+.1%} from {base_txt} {base:,.0f}"
+              + ("" if base == last else f", {tp / last - 1:+.1%} from {last:,.0f} now")
+              + f"; {a.take_profit:g} x {vol_txt} {sd_h:.1%}, a SELL limit)")
+    if tp is not None and r is not None:            # sanity check only: the LSTM has no vote
+        e = r["fc"].iloc[-1]
+        where = ("above its P90: unlikely" if tp > e.lstm_p90 else
+                 "between its median and P90: possible, less likely than not" if tp > e.lstm_p50 else
+                 "at or below its median: within the expected range")
+        print(f"    {'LSTM check':<16}: target {where} within {a.days} days "
+              f"(80% range {e.lstm_p10:,.0f} - {e.lstm_p90:,.0f}, median {e.lstm_p50:,.0f}; no edge, no vote)")
+    if sl is not None:
+        print(f"    {'Stop loss':<16}: {sl:,.0f}  ({sl / base - 1:+.1%}, {a.stop_loss:g} x {vol_txt}, "
+              f"SELL if it trades there)")
 
     print()
     if t is not None:
@@ -595,6 +673,13 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
         print(f"  {f'Next {cfg.horizon} sessions 80%':<26}: {to_tick(last * np.exp(-z * sd_h), up=False):,.0f} - "
               f"{to_tick(last * np.exp(z * sd_h), up=True):,.0f}  (volatility only: where it can reach "
               f"either way, not a forecast)")
+
+    if checks:
+        bad = [d for d, b, _ in checks if b]
+        print(f"  {'Data check':<26}: " + (f"SUSPICIOUS bar(s) on {', '.join(f'{d:%d %b}' for d in bad)}: "
+                                           "verify before trading (see the data check above)" if bad else
+                                           f"{len(checks)} unusual move(s) since {checks[0][0]:%d %b}, "
+                                           "they look real; levels are wider for now"))
 
     model_owns = cur_pos > 0
     print(f"\n  Model's own paper position: {act} (P(up) today {p.iloc[-1]:.3f})"
@@ -630,7 +715,8 @@ def analyze(ticker: str, a: argparse.Namespace, owned: bool, cost: float | None 
         "action": act, "owned": owned, "advice": call, "signal_advice": s_call,
         "forecast_advice": f_call, "forecast_model": f_model, "forecast_move": round(f_move, 4),
         "lstm_20d_move": None if lstm_move is None else round(lstm_move, 4),
-        "buy_price": cost, "take_profit": tp, "stop_loss": sl,
+        "buy_price": cost, "buy_limit": None if (t is None and provisional) else buy_at, "max_buy": cap,
+        "take_profit": tp, "stop_loss": sl,
         "provisional": provisional,
         "price_at": "" if live_at is None else f"{live_at:%Y-%m-%d %H:%M}",
         "run_at": now.strftime("%Y-%m-%d %H:%M WIB"),
